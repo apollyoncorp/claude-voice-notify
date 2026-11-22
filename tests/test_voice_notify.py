@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -28,8 +29,15 @@ class StateTestCase(unittest.TestCase):
         self.vn = importlib.reload(voice_notify)
         self.env = mock.patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "cli"})
         self.env.start()
+        # Never the real microphone, never a real notification: a test that needs them says so.
+        self.no_mic = mock.patch.object(self.vn, "coreaudio_inputs", return_value=None)
+        self.no_mic.start()
+        self.no_notify = mock.patch.object(self.vn, "notify", side_effect=AssertionError("real notification"))
+        self.no_notify.start()
 
     def tearDown(self):
+        self.no_notify.stop()
+        self.no_mic.stop()
         self.env.stop()
         os.environ.pop("CLAUDE_VOICE_NOTIFY_HOME", None)
         shutil.rmtree(self.home, ignore_errors=True)
@@ -203,7 +211,7 @@ class QueueTest(StateTestCase):
             self.vn.enqueue(text, "en", spawn=False)
         spoken = []
         with mock.patch.object(self.vn, "chosen_voice", return_value="v"):
-            self.vn.speak_queue(lambda text, voice, lang: spoken.append((text, voice, lang)))
+            self.vn.speak_queue(lambda text, voice, lang, **kw: spoken.append((text, voice, lang)))
         self.assertEqual(spoken, [("one", "v", "en"), ("two", "v", "en"), ("three", "v", "en")])
         self.assertEqual(self.vn.QUEUE.read_text(), "")
 
@@ -220,7 +228,7 @@ class QueueTest(StateTestCase):
         held = self.vn.lock("speaker.lock")
         try:
             spoken = []
-            self.vn.speak_queue(lambda *a: spoken.append(a))
+            self.vn.speak_queue(lambda *a, **kw: spoken.append(a))
             self.assertEqual(spoken, [])
         finally:
             held.release()
@@ -378,6 +386,27 @@ class HookTest(StateTestCase):
         self.assertIsNone(self.vn.recall_agent("s1"))
         self.vn.remember_agent("s1", ("o", "Orion"))
         self.assertEqual(self.vn.recall_agent("s1"), ("o", "Orion"))
+
+    def test_the_name_the_agent_gave_is_the_who(self):
+        self.turn_on()
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(self.folder())}):
+            _, enqueue = self.run_hook({"hook_event_name": "Stop", "session_id": "s1",
+                                        "last_assistant_message": "🔊 Alex, aqui é o Orion. Terminei."})
+        self.assertEqual(enqueue.call_args[1]["who"], "O Orion")
+
+    def test_without_a_name_the_who_is_the_repository(self):
+        self.turn_on()
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(self.folder())}):
+            _, enqueue = self.run_hook({"hook_event_name": "Notification", "session_id": "s2",
+                                        "notification_type": "permission_prompt"})
+        self.assertEqual(enqueue.call_args[1]["who"], "my cool app")
+
+    def test_who_is_saved_in_the_queue_line(self):
+        self.vn.enqueue("hi", "en", spawn=False, who="Orion")
+        self.assertEqual(json.loads(self.vn.QUEUE.read_text()), {"text": "hi", "lang": "en", "who": "Orion"})
+        self.vn.QUEUE.write_text("")
+        self.vn.enqueue("hi", "en", spawn=False)
+        self.assertEqual(json.loads(self.vn.QUEUE.read_text()), {"text": "hi", "lang": "en"})
 
     def test_bad_input_never_raises(self):
         self.turn_on()
@@ -586,6 +615,425 @@ class CommandTest(StateTestCase):
             self.assertIn("usage", self.vn.command(["lang", "fr"]))
             self.assertIn("off", self.vn.command(["off"]))
             self.assertFalse(self.vn.ENABLED.exists())
+
+
+DICTATION = (4101, "com.example.editor.helper")    # an app that opens the input while you dictate
+CALL = (4102, "com.hnc.Discord.helper.Renderer")  # a call app's helper process
+DAEMON = (4103, "com.apple.CoreSpeech")           # always listening
+NAMELESS = (4104, "historicalaudiod")             # no bundle id: identified by its process name
+
+
+class MicClassificationTest(StateTestCase):
+    """Which processes count, with the CoreAudio query mocked."""
+
+    def state(self, inputs, config=None, mac=True):
+        with mock.patch.object(self.vn, "system", return_value="mac" if mac else "linux"), \
+                mock.patch.object(self.vn, "coreaudio_inputs", return_value=inputs):
+            return self.vn.mic_state(config if config is not None else {})
+
+    def test_nobody_listening_is_free(self):
+        self.assertEqual(self.state([]), "free")
+
+    def test_daemons_that_always_listen_are_ignored(self):
+        self.assertEqual(self.state([DAEMON, NAMELESS]), "free")
+
+    def test_an_app_listening_makes_it_busy(self):
+        self.assertEqual(self.state([DAEMON, DICTATION]), "busy")
+
+    def test_a_call_app_makes_it_a_call_and_beats_busy(self):
+        self.assertEqual(self.state([CALL]), "call")
+        self.assertEqual(self.state([DICTATION, CALL, DAEMON]), "call")
+
+    def test_a_bundle_id_also_covers_its_helpers_and_ignores_case(self):
+        self.assertTrue(self.vn.matches("com.hnc.Discord.helper.Renderer", ["com.hnc.Discord"]))
+        self.assertTrue(self.vn.matches("COM.HNC.DISCORD", ["com.hnc.discord"]))
+        self.assertFalse(self.vn.matches("com.hnc.DiscordCanary", ["com.hnc.Discord"]))   # not a prefix of a word
+        self.assertFalse(self.vn.matches("com.hnc", ["com.hnc.Discord"]))
+
+    def test_defaults_cover_the_usual_call_apps(self):
+        for bundle in ("us.zoom.xos", "com.microsoft.teams2", "com.apple.FaceTime", "com.tinyspeck.slackmacgap"):
+            self.assertEqual(self.state([(1, bundle)]), "call", bundle)
+
+    def test_your_own_lists_replace_the_defaults(self):
+        self.assertEqual(self.state([DICTATION], {"mic_ignore": ["com.example.editor"]}), "free")
+        self.assertEqual(self.state([CALL], {"mic_calls": []}), "busy")
+        self.assertEqual(self.state([DAEMON], {"mic_ignore": []}), "busy")
+        self.assertEqual(self.state([(1, "com.example.meet")], {"mic_calls": ["com.example.meet"]}), "call")
+
+    def test_report_names_each_process_and_its_role(self):
+        with mock.patch.object(self.vn, "system", return_value="mac"), \
+                mock.patch.object(self.vn, "coreaudio_inputs", return_value=[DAEMON, DICTATION, CALL]):
+            state, rows = self.vn.mic_report({})
+        self.assertEqual(state, "call")
+        self.assertEqual([r[2] for r in rows], ["ignored", "busy", "call"])
+
+    def test_when_it_cannot_tell_it_is_free(self):
+        self.assertEqual(self.state(None), "free")                            # macOS before 14, or no CoreAudio
+        self.assertEqual(self.state([CALL], mac=False), "free")               # no detection off macOS
+        self.assertEqual(self.state([CALL], {"mic_aware": False}), "free")    # switched off
+        with mock.patch.object(self.vn, "system", return_value="mac"), \
+                mock.patch.object(self.vn, "coreaudio_inputs", side_effect=RuntimeError("boom")):
+            self.assertEqual(self.vn.mic_state({}), "free")
+        with mock.patch.object(self.vn, "system", return_value="mac"), \
+                mock.patch.object(self.vn, "coreaudio_inputs", return_value=[DICTATION]):
+            self.assertEqual(self.vn.mic_state({"mic_ignore": "not a list"}), "busy")   # bad config: defaults
+
+    def test_a_switched_off_watch_does_not_even_ask(self):
+        with mock.patch.object(self.vn, "system", return_value="mac"), \
+                mock.patch.object(self.vn, "coreaudio_inputs") as ask:
+            self.vn.mic_state({"mic_aware": False})
+        ask.assert_not_called()
+
+    def test_a_process_without_a_bundle_id_is_known_by_its_name(self):
+        ps = subprocess.CompletedProcess([], 0, "/usr/libexec/historicalaudiod\n", "")
+        with mock.patch.object(self.vn, "run", return_value=ps) as run:
+            self.assertEqual(self.vn.process_name(999999), "historicalaudiod")   # no such pid for proc_name: ps answers
+            self.assertEqual(self.vn.process_name(999999), "historicalaudiod")
+        run.assert_called_once()   # the name is kept: asking costs a process
+        ps = subprocess.CompletedProcess([], 1, "", "")
+        with mock.patch.object(self.vn, "run", return_value=ps):
+            self.assertEqual(self.vn.process_name(999998), "")
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS only")
+    def test_a_live_process_has_a_name(self):
+        self.assertTrue(self.vn.process_name(os.getpid()))
+
+    def test_coreaudio_is_not_asked_off_macOS(self):
+        self.no_mic.stop()
+        try:
+            with mock.patch.object(self.vn, "system", return_value="linux"):
+                self.assertIsNone(self.vn.coreaudio_inputs())
+        finally:
+            self.no_mic.start()
+
+
+@unittest.skipUnless(sys.platform == "darwin", "CoreAudio is macOS only")
+class CoreAudioLiveTest(StateTestCase):
+    """Read-only look at the real CoreAudio: whatever is listening, the answer has the right shape."""
+
+    def test_the_real_query_returns_pairs_or_none(self):
+        self.no_mic.stop()
+        try:
+            found = self.vn.coreaudio_inputs()
+        finally:
+            self.no_mic.start()
+        self.assertTrue(found is None or all(isinstance(pid, int) and isinstance(who, str) and who
+                                             for pid, who in found), found)
+
+
+def mic_sequence(*states):
+    """A mic() that answers the states in order, and keeps answering the last one."""
+    queue = list(states)
+    return lambda: queue.pop(0) if len(queue) > 1 else queue[0]
+
+
+@unittest.skipUnless(hasattr(os, "fork"), "flock queue needs macOS or Linux")
+class MicAwareQueueTest(StateTestCase):
+    def setUp(self):
+        super().setUp()
+        self.spoken, self.sleeps, self.notes = [], [], []
+        patch = mock.patch.object(self.vn, "chosen_voice", return_value="v")
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def queue(self, *texts, who=""):
+        for text in texts:
+            self.vn.enqueue(text, "en", spawn=False, who=who)
+
+    def say(self, text, voice, lang, stop=None):
+        self.spoken.append(text)
+        return True
+
+    def run_queue(self, mic, say=None, lang_notes=None):
+        self.vn.speak_queue(say or self.say, mic=mic, sleep=self.sleeps.append,
+                            notifier=lambda title, body: self.notes.append((title, body)) or True)
+
+    def test_a_free_microphone_speaks_as_before(self):
+        self.queue("one", "two")
+        self.run_queue(lambda: "free")
+        self.assertEqual(self.spoken, ["one", "two"])
+        self.assertEqual(self.sleeps, [])
+        self.assertEqual(self.notes, [])
+
+    def test_a_busy_microphone_makes_it_wait_and_nothing_is_lost(self):
+        self.queue("one", "two")
+        self.run_queue(mic_sequence("busy", "busy", "busy", "free"))
+        self.assertEqual(self.spoken, ["one", "two"])
+        self.assertEqual(self.sleeps[:3], [self.vn.MIC_POLL] * 3)
+        self.assertEqual(self.sleeps[3], self.vn.MIC_SETTLE)   # it stays closed a moment before we speak
+        self.assertEqual(self.vn.QUEUE.read_text(), "")
+
+    def test_while_it_waits_the_announcement_stays_in_the_queue(self):
+        self.queue("one")
+        seen = []
+
+        def sleeping(seconds):
+            seen.append(self.vn.QUEUE.read_text().count("one"))
+        self.vn.speak_queue(self.say, mic=mic_sequence("busy", "busy", "free"), sleep=sleeping)
+        self.assertEqual(seen[:2], [1, 1])
+        self.assertEqual(self.spoken, ["one"])
+
+    def test_opening_during_the_settle_pause_waits_again(self):
+        self.queue("one")
+        self.run_queue(mic_sequence("busy", "free", "busy", "free"))
+        self.assertEqual(self.sleeps, [self.vn.MIC_POLL, self.vn.MIC_SETTLE, self.vn.MIC_POLL, self.vn.MIC_SETTLE])
+        self.assertEqual(self.spoken, ["one"])
+
+    def test_busy_with_nothing_to_say_does_not_hang_around(self):
+        self.run_queue(lambda: "busy")
+        self.assertEqual((self.spoken, self.sleeps), ([], []))
+
+    def test_the_speech_is_told_when_to_stop(self):
+        self.queue("one")
+        seen = {}
+
+        def say(text, voice, lang, stop=None):
+            seen["stop"] = stop
+            return True
+        state = {"now": "free"}
+        self.run_queue(lambda: state["now"], say)
+        self.assertFalse(seen["stop"]())
+        state["now"] = "busy"
+        self.assertTrue(seen["stop"]())
+        state["now"] = "call"
+        self.assertTrue(seen["stop"]())
+
+    def test_opening_in_the_middle_cuts_it_and_it_is_said_again_whole_before_the_next(self):
+        self.queue("one", "two")
+        plays = []
+
+        def say(text, voice, lang, stop=None):
+            plays.append(text)
+            return len(plays) != 1   # the first play is cut
+        # free (start "one", which gets cut), busy, busy (it waits), free (closed, then the settle pause)
+        self.run_queue(mic_sequence("free", "busy", "busy", "free"), say)
+        self.assertEqual(plays, ["one", "one", "two"])
+        self.assertEqual(self.sleeps, [self.vn.MIC_POLL, self.vn.MIC_POLL, self.vn.MIC_SETTLE])
+        self.assertEqual(self.vn.QUEUE.read_text(), "")
+
+    def test_a_requeued_announcement_keeps_its_name_and_goes_first(self):
+        self.queue("two", who="Luna")
+        self.vn.requeue_front({"text": "one", "lang": "pt-BR", "who": "O Orion"})
+        first, second = self.vn.dequeue(), self.vn.dequeue()
+        self.assertEqual((first["text"], first["who"], first["lang"]), ("one", "O Orion", "pt-BR"))
+        self.assertEqual((second["text"], second["who"]), ("two", "Luna"))
+
+    def test_in_a_call_nothing_is_spoken_and_a_notification_carries_the_text(self):
+        self.queue("The landing page is ready. Please review.", who="O Orion")
+        self.run_queue(lambda: "call")
+        self.assertEqual(self.spoken, [])
+        self.assertEqual(self.notes, [("O Orion wants to talk to you", "The landing page is ready. Please review.")])
+        self.assertEqual(self.vn.QUEUE.read_text(), "")
+        self.assertIn("call: notified O Orion: The landing page is ready.", self.vn.LOG.read_text())
+
+    def test_in_a_call_every_waiting_announcement_gets_its_own_notification_and_none_is_spoken_later(self):
+        self.queue("one", "two", who="Orion")
+        self.run_queue(lambda: "call")
+        self.assertEqual([n[1] for n in self.notes], ["one", "two"])
+        self.run_queue(lambda: "free")   # the call ended: nothing is left to say
+        self.assertEqual(self.spoken, [])
+
+    def test_the_notification_is_in_the_language_of_the_announcement_and_falls_back_to_a_name(self):
+        self.vn.enqueue("Terminei.", "pt-BR", spawn=False, who="O Orion")
+        self.vn.enqueue("Done.", "en", spawn=False)
+        self.run_queue(lambda: "call")
+        self.assertEqual(self.notes, [("O Orion quer falar com você", "Terminei."), ("Claude wants to talk to you", "Done.")])
+
+    def test_a_failed_notification_is_in_the_log(self):
+        self.queue("one", who="Orion")
+        self.vn.speak_queue(self.say, mic=lambda: "call", notifier=lambda t, b: False)
+        self.assertIn("call: notification failed Orion: one", self.vn.LOG.read_text())
+
+    def test_a_call_that_starts_in_the_middle_turns_the_cut_announcement_into_a_notification(self):
+        self.queue("one", "two", who="Orion")
+        plays = []
+
+        def say(text, voice, lang, stop=None):
+            plays.append(text)
+            return False   # cut
+        self.run_queue(mic_sequence("free", "call"), say)
+        self.assertEqual(plays, ["one"])
+        self.assertEqual([n[1] for n in self.notes], ["one", "two"])
+
+    def test_a_failing_query_means_it_speaks_normally(self):
+        self.queue("one", "two")
+        with mock.patch.object(self.vn, "system", return_value="mac"), \
+                mock.patch.object(self.vn, "coreaudio_inputs", side_effect=RuntimeError("boom")):
+            self.vn.speak_queue(self.say, sleep=self.sleeps.append)
+        self.assertEqual(self.spoken, ["one", "two"])
+        self.assertEqual(self.sleeps, [])
+
+    def test_the_real_default_is_the_watching_one_on_macOS_and_not_elsewhere(self):
+        seen = []
+
+        def say(text, voice, lang, stop=None):
+            seen.append(stop)
+            return True
+        for system, config, watched in (("mac", {}, True), ("mac", {"mic_aware": False}, False), ("linux", {}, False)):
+            self.vn.save_config(mic_aware=config.get("mic_aware"))
+            self.queue("one")
+            with mock.patch.object(self.vn, "system", return_value=system), \
+                    mock.patch.object(self.vn, "coreaudio_inputs", return_value=[]):
+                self.vn.speak_queue(say, sleep=self.sleeps.append)
+            self.assertEqual(seen.pop() is not None, watched, (system, config))
+
+    def test_a_busy_microphone_released_by_switching_the_watch_off(self):
+        self.queue("one")
+        inputs = {"now": [DICTATION]}
+
+        def sleeping(seconds):
+            self.vn.save_config(mic_aware=False)   # /voice-notify mic off, while the announcement waits
+        with mock.patch.object(self.vn, "system", return_value="mac"), \
+                mock.patch.object(self.vn, "coreaudio_inputs", side_effect=lambda: inputs["now"]):
+            self.vn.speak_queue(self.say, sleep=sleeping)
+        self.assertEqual(self.spoken, ["one"])
+
+
+@unittest.skipIf(os.name == "nt", "POSIX processes")
+class StoppableSpeechTest(StateTestCase):
+    def test_a_process_that_finishes_returns_its_code(self):
+        self.assertEqual(self.vn.run_stoppable(["sh", "-c", "exit 3"], 10, lambda: False), 3)
+        r = self.vn.run(["sh", "-c", "exit 0"], stop=lambda: False)
+        self.assertEqual(r.returncode, 0)
+
+    def test_stop_kills_the_process_and_raises(self):
+        marker = Path(self.home) / "finished"
+        with mock.patch.object(self.vn, "MIC_WATCH", 0.05):
+            started = time.monotonic()
+            with self.assertRaises(self.vn.Interrupted):
+                self.vn.run_stoppable(["sh", "-c", f"sleep 30; touch {shlex.quote(str(marker))}"], 60, lambda: True)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertFalse(marker.exists())
+
+    def test_stop_is_checked_while_it_runs(self):
+        calls = []
+
+        def stop():
+            calls.append(1)
+            return len(calls) >= 3
+        with mock.patch.object(self.vn, "MIC_WATCH", 0.05), self.assertRaises(self.vn.Interrupted):
+            self.vn.run_stoppable(["sleep", "30"], 60, stop)
+        self.assertEqual(len(calls), 3)
+
+    def test_the_timeout_still_applies(self):
+        with mock.patch.object(self.vn, "MIC_WATCH", 0.05):
+            self.assertEqual(self.vn.run_stoppable(["sleep", "30"], 0.2, lambda: False), 124)
+
+    def test_your_own_program_is_cut_too(self):
+        with mock.patch.object(self.vn, "system", return_value="linux"), mock.patch.object(self.vn, "MIC_WATCH", 0.05):
+            with self.assertRaises(self.vn.Interrupted):
+                self.vn.run_command("sleep 30 #", "x", "", "en", stop=lambda: True)
+            self.assertTrue(self.vn.run_command("true #", "x", "", "en", stop=lambda: False))
+
+    def test_speak_passes_the_stop_function_down_and_the_default_say_reports_the_cut(self):
+        stop = lambda: True  # noqa: E731
+        with mock.patch.object(self.vn, "system_engine", return_value="avspeech"), \
+                mock.patch.object(self.vn, "run", side_effect=self.vn.Interrupted()) as run:
+            self.assertFalse(self.vn.default_say({})("hi", "", "en", stop=stop))
+        self.assertIs(run.call_args[1]["stop"], stop)
+        with mock.patch.object(self.vn, "speak") as speak:
+            self.assertTrue(self.vn.default_say({})("hi", "", "en"))
+        speak.assert_called_once()
+
+
+class NotifyTest(StateTestCase):
+    def test_title_and_body_travel_as_arguments_not_inside_the_script(self):
+        self.no_notify.stop()
+        try:
+            title, body = 'The "Orion" \\ agent', 'Done; $(touch pwned) "quoted" \\ back'
+            with mock.patch.object(self.vn, "system", return_value="mac"), \
+                    mock.patch.object(self.vn, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+                self.assertTrue(self.vn.notify(title, body))
+            cmd = run.call_args[0][0]
+            self.assertEqual(cmd[0], "osascript")
+            self.assertEqual(cmd[-2:], [title, body])
+            script = " ".join(cmd[1:-2])
+            self.assertNotIn("pwned", script)
+            self.assertIn("display notification", script)
+            with mock.patch.object(self.vn, "system", return_value="mac"), \
+                    mock.patch.object(self.vn, "run", return_value=subprocess.CompletedProcess([], 1, "", "")):
+                self.assertFalse(self.vn.notify("t", "b"))
+            with mock.patch.object(self.vn, "system", return_value="linux"):
+                self.assertFalse(self.vn.notify("t", "b"))
+        finally:
+            self.no_notify.start()
+
+
+class MicCommandTest(StateTestCase):
+    def cmd(self, *args, inputs=(), mac=True):
+        with mock.patch.object(self.vn, "system", return_value="mac" if mac else "linux"), \
+                mock.patch.object(self.vn, "system_engine", return_value="avspeech"), \
+                mock.patch.object(self.vn, "coreaudio_inputs", return_value=list(inputs)):
+            return self.vn.command(["mic", *args])
+
+    def test_status_shows_the_state_and_both_lists(self):
+        out = self.cmd()
+        self.assertIn("microphone: watched, free now", out)
+        self.assertIn("com.hnc.Discord", out)
+        self.assertIn("com.apple.CoreSpeech", out)
+
+    def test_main_status_has_a_microphone_line(self):
+        with mock.patch.object(self.vn, "system", return_value="mac"), \
+                mock.patch.object(self.vn, "system_engine", return_value="avspeech"), \
+                mock.patch.object(self.vn, "coreaudio_inputs", return_value=[DICTATION]):
+            self.assertIn("microphone: watched, busy now", self.vn.command(["status"]))
+        with mock.patch.object(self.vn, "system", return_value="linux"):
+            self.assertIn("microphone: not watched on this system", self.vn.command(["status"]))
+        with mock.patch.object(self.vn, "system", return_value="mac"), \
+                mock.patch.object(self.vn, "coreaudio_inputs", return_value=None):
+            self.assertIn("can't be read here", self.vn.command(["status"]))
+
+    def test_off_and_on(self):
+        self.assertIn("not watched", self.cmd("off"))
+        self.assertIs(self.vn.load_config()["mic_aware"], False)
+        self.assertIn("watched, free now", self.cmd("on"))
+        self.assertIs(self.vn.load_config()["mic_aware"], True)
+
+    def test_now_lists_who_is_listening(self):
+        out = self.cmd("now", inputs=[DAEMON, DICTATION, CALL])
+        self.assertIn("com.apple.CoreSpeech  (pid 4103)  ignored", out)
+        self.assertIn("com.example.editor.helper  (pid 4101)  listening: it waits", out)
+        self.assertIn("com.hnc.Discord.helper.Renderer  (pid 4102)  in a call", out)
+        self.assertIn("state: call", out)
+
+    def test_now_when_it_cannot_be_read(self):
+        with mock.patch.object(self.vn, "system", return_value="mac"), \
+                mock.patch.object(self.vn, "coreaudio_inputs", return_value=None):
+            self.assertIn("can't be read here", self.vn.command(["mic", "now"]))
+
+    def test_editing_the_call_list(self):
+        self.assertIn("com.example.meet", self.cmd("call", "add", "com.example.meet"))
+        calls = self.vn.load_config()["mic_calls"]
+        self.assertEqual(calls[-1], "com.example.meet")
+        self.assertIn("com.hnc.Discord", calls)           # the defaults came along
+        self.cmd("call", "add", "COM.EXAMPLE.MEET")       # no duplicate
+        self.assertEqual(self.vn.load_config()["mic_calls"], calls)
+        self.cmd("call", "remove", "com.hnc.Discord")
+        self.assertNotIn("com.hnc.Discord", self.vn.load_config()["mic_calls"])
+        self.cmd("call", "reset")
+        self.assertNotIn("mic_calls", self.vn.load_config())
+
+    def test_editing_the_ignore_list(self):
+        self.cmd("ignore", "add", "com.example.always")
+        self.assertIn("com.example.always", self.vn.load_config()["mic_ignore"])
+        self.assertIn("com.apple.CoreSpeech", self.vn.load_config()["mic_ignore"])
+        self.cmd("ignore", "remove", "com.apple.CoreSpeech")
+        self.assertNotIn("com.apple.CoreSpeech", self.vn.load_config()["mic_ignore"])
+        self.cmd("ignore", "reset")
+        self.assertNotIn("mic_ignore", self.vn.load_config())
+        self.assertIn("com.apple.CoreSpeech", self.cmd("ignore"))
+
+    def test_bad_arguments_show_the_usage_and_change_nothing(self):
+        for args in (("call", "add"), ("call", "add", "has space"), ("call", "add", "a", "b"), ("ignore", "remove"),
+                     ("call", "reset", "x"), ("bogus",), ("on", "x")):
+            self.assertIn("usage: /voice-notify mic", self.cmd(*args), args)
+        self.assertFalse(self.vn.CONFIG.exists())
+        self.assertIn("mic [on|off|now", self.vn.USAGE)
+
+    def test_none_removes_a_config_key(self):
+        self.vn.save_config(voice="x", language="en")
+        self.vn.save_config(voice=None)
+        self.assertEqual(self.vn.load_config(), {"language": "en"})
 
 
 if __name__ == "__main__":

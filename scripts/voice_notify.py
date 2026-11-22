@@ -8,7 +8,10 @@ One file, standard library only, Python 3.9+. Claude Code runs it as a hook:
   Notification      (async)  queues "<name> needs you." when a permission prompt or question waits, with the
                              name the agent used in this session, or the repository name if it never gave one
 
-and the /voice-notify command runs it with on, off, test, voices, status, lang, voice or command.
+and the /voice-notify command runs it with on, off, test, voices, status, lang, voice, command or mic.
+
+On macOS it also watches the microphone (CoreAudio, through ctypes): while an app is listening to you it waits its
+turn, and while you are in a call it shows a notification instead of speaking (see "microphone" below).
 
 It speaks with the system's own engine: AVSpeech on macOS (reaches the Siri voices), speech-dispatcher or
 eSpeak NG on Linux, System.Speech on Windows. Or with a program you choose (/voice-notify command).
@@ -28,7 +31,8 @@ from pathlib import Path
 
 STATE = Path(os.environ.get("CLAUDE_VOICE_NOTIFY_HOME") or Path.home() / ".claude" / "voice-notify")
 ENABLED = STATE / "enabled"      # exists = speak
-CONFIG = STATE / "config.json"   # {"language": "auto" | "en" | "pt-BR", "voice": "" (auto) | name, "command": ""}
+CONFIG = STATE / "config.json"   # {"language": "auto" | "en" | "pt-BR", "voice": "" (auto) | name, "command": "",
+#                                  "mic_aware": true, "mic_ignore": [...], "mic_calls": [...]}
 QUEUE = STATE / "queue.jsonl"    # announcements waiting their turn, one JSON per line
 LOG = STATE / "voice.log"        # last 50 hook events, including the silent ones
 AGENTS = STATE / "agents.json"   # {session_id: {"article", "name", "at"}}: the name an agent used in that session
@@ -36,6 +40,14 @@ AGENTS_KEEP = 200
 LOG_LINES = 50
 
 LANGUAGES = ("en", "pt-BR")
+
+# Microphone (macOS 14+). A process "has the input open" when CoreAudio says it is running input. Some always do.
+MIC_IGNORE = ("com.apple.CoreSpeech", "historicalaudiod")   # always listening, whatever you do (bundle id or process name)
+MIC_CALLS = ("com.hnc.Discord", "us.zoom.xos", "com.microsoft.teams2", "com.microsoft.teams", "com.apple.FaceTime",
+             "com.tinyspeck.slackmacgap")   # a bundle id also matches its helpers: com.hnc.Discord.helper.Renderer
+MIC_POLL = 0.5     # seconds between looks at the microphone while an announcement waits
+MIC_SETTLE = 1.0   # the input must stay closed this long before a waiting announcement is spoken
+MIC_WATCH = 0.4    # while speaking: how often to look at the microphone, so a sentence is cut soon after you start talking
 
 # The line is written by the same Claude that did the work, so it costs nothing extra and knows what matters.
 # It speaks as itself, in first person. The "this is <name>" / "aqui é o <nome>" opening is what the plugin
@@ -70,6 +82,7 @@ PHRASES = {
         "question": ("{p} has a question for you.",),
         "on": "Voice on.",
         "test": "This is how I will sound when I have something to tell you.",
+        "call_title": "{p} wants to talk to you",   # the notification shown instead of speaking, while you are in a call
     },
     "pt-BR": {
         "done": ("{p} terminou.", "Pronto, {p} acabou.", "{p} terminou, dá uma olhada quando puder.", "Terminei no {p}."),
@@ -78,6 +91,7 @@ PHRASES = {
         "question": ("{p} tem uma pergunta pra você.",),
         "on": "Voz ligada.",
         "test": "É assim que eu vou soar quando tiver algo pra te contar.",
+        "call_title": "{p} quer falar com você",
     },
 }
 
@@ -124,7 +138,40 @@ def system():
     return "linux" if sys.platform.startswith("linux") else sys.platform
 
 
-def run(cmd, cwd=None, timeout=10, env=None):
+class Interrupted(Exception):
+    """The microphone opened while something was being said: the speech was cut."""
+
+
+def run_stoppable(cmd, timeout, stop, **popen):
+    """Runs cmd and waits for it, looking at stop() every MIC_WATCH seconds. If stop() says True the process (and,
+    on macOS and Linux, its whole group) is killed and Interrupted is raised. Returns the exit code."""
+    group = os.name != "nt"
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                creationflags=NO_WINDOW, start_new_session=group, **popen)
+    except OSError:
+        return 127
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return proc.wait(timeout=MIC_WATCH)
+        except subprocess.TimeoutExpired:
+            pass
+        timed_out = time.monotonic() > deadline
+        if timed_out or stop():
+            try:
+                os.killpg(proc.pid, 15) if group else proc.kill()   # 15 = SIGTERM
+            except OSError:
+                pass
+            proc.wait()
+            if timed_out:
+                return 124
+            raise Interrupted()
+
+
+def run(cmd, cwd=None, timeout=10, env=None, stop=None):
+    if stop:   # speech that can be cut: see run_stoppable
+        return subprocess.CompletedProcess(cmd, run_stoppable(cmd, timeout, stop, cwd=cwd, env=env), "", "")
     try:
         return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
                               timeout=timeout, env=env, creationflags=NO_WINDOW)
@@ -143,8 +190,10 @@ def load_config():
 
 
 def save_config(**changes):
+    """Saves the changes; a value of None removes the key (back to the default)."""
     c = load_config()
     c.update(changes)
+    c = {k: v for k, v in c.items() if v is not None}
     STATE.mkdir(parents=True, exist_ok=True)
     CONFIG.write_text(json.dumps(c, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
@@ -249,44 +298,200 @@ def speech_env(text, voice, lang):
     return dict(os.environ, VOICE_NOTIFY_TEXT=text, VOICE_NOTIFY_LANG=lang, VOICE_NOTIFY_VOICE=voice or "")
 
 
-def run_command(command, text, voice, lang):
+def run_command(command, text, voice, lang, stop=None):
     """Your own speech program. It runs in the system shell with the text in VOICE_NOTIFY_TEXT (plus _LANG and
-    _VOICE); on macOS and Linux the text is also its last argument. True if it exited with 0."""
+    _VOICE); on macOS and Linux the text is also its last argument. True if it exited with 0. With `stop`, see
+    run_stoppable (Interrupted is raised if it says True)."""
     env = speech_env(text, voice, lang)
     try:
         if system() == "windows":
-            r = subprocess.run(command, shell=True, env=env, timeout=300, creationflags=NO_WINDOW,
-                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            argv, shell = command, True
         else:
-            r = subprocess.run(["/bin/sh", "-c", command + ' "$VOICE_NOTIFY_TEXT"'], env=env, timeout=300,
-                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            argv, shell = ["/bin/sh", "-c", command + ' "$VOICE_NOTIFY_TEXT"'], False
+        if stop:
+            return run_stoppable(argv, 300, stop, shell=shell, env=env) == 0
+        r = subprocess.run(argv, shell=shell, env=env, timeout=300, creationflags=NO_WINDOW,
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return r.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
 
 
-def speak(text, voice, lang, command=""):
-    """Says the text and returns when it's done. Your program goes first; if it fails, the system voice speaks."""
-    if command and run_command(command, text, voice, lang):
+def speak(text, voice, lang, command="", stop=None):
+    """Says the text and returns when it's done. Your program goes first; if it fails, the system voice speaks.
+    `stop` is a function that returns True when the speech must be cut: Interrupted is raised."""
+    kw = {"stop": stop} if stop else {}
+    if command and run_command(command, text, voice, lang, **kw):
         return
     engine = system_engine()
     if engine == "avspeech":
         # A dotted identifier goes through AVSpeech (reaches Siri), a short name through `say -v`.
         if voice and "." not in voice:
-            r = run(["say", "-v", voice, text], timeout=180)
+            r = run(["say", "-v", voice, text], timeout=180, **kw)
         else:
-            r = run(["osascript", "-l", "JavaScript", "-e", SPEAK_JS, voice or "", lang, text], timeout=180)
+            r = run(["osascript", "-l", "JavaScript", "-e", SPEAK_JS, voice or "", lang, text], timeout=180, **kw)
         if r.returncode:
-            run(["say", text], timeout=180)
+            run(["say", text], timeout=180, **kw)
     elif engine == "sapi":
         run(["powershell", "-NoProfile", "-NonInteractive", "-Command", SAPI_PS], timeout=180,
-            env=speech_env(text, voice, lang))
+            env=speech_env(text, voice, lang), **kw)
     elif engine == "spd-say":   # -w waits until the sentence is spoken
-        r = run(["spd-say", "-w", "-l", lang] + (["-y", voice] if voice else []) + [text], timeout=90)
+        r = run(["spd-say", "-w", "-l", lang] + (["-y", voice] if voice else []) + [text], timeout=90, **kw)
         if r.returncode and shutil.which("espeak-ng"):   # no speech-dispatcher daemon or audio: try eSpeak NG
-            run(["espeak-ng", "-v", ESPEAK_VOICE[lang], text], timeout=180)
+            run(["espeak-ng", "-v", ESPEAK_VOICE[lang], text], timeout=180, **kw)
     elif engine == "espeak-ng":
-        run(["espeak-ng", "-v", voice or ESPEAK_VOICE[lang], text], timeout=180)
+        run(["espeak-ng", "-v", voice or ESPEAK_VOICE[lang], text], timeout=180, **kw)
+
+# --- microphone ----------------------------------------------------------------------------------------------
+# Speaking over you is rude, and in a call it leaks into the other person's ears. macOS 14+ tells which processes
+# have an audio input open (CoreAudio: kAudioHardwarePropertyProcessObjectList, then per process
+# kAudioProcessPropertyIsRunningInput, ...PID and ...BundleID). The device-level "running somewhere" flag does not
+# work for this: a few system daemons keep the input open all day, so it never goes to 0.
+#
+# Three states: "free" (speak as always), "busy" (an app is listening to you: wait, speak when it closes) and
+# "call" (a call app listens: do not speak, show a notification). Any failure, or any other system, means "free":
+# the voice behaves as it did before this existed, and a broken query can never hold the queue.
+
+CA_SELECTORS = {"list": b"prs#", "input": b"piri", "pid": b"ppid", "bundle": b"pbid"}
+CA_GLOBAL, CA_MAIN = b"glob", 0
+CA_SYSTEM_OBJECT = 1
+CF_UTF8 = 0x08000100
+
+
+def fourcc(code):
+    return int.from_bytes(code, "big")
+
+
+PROCESS_NAMES = {}   # pid -> name: a name never changes, and asking costs a process
+
+
+def process_name(pid):
+    """The executable name of a process, for the ones that have no bundle id. "" if unknown. proc_name refuses
+    processes of other users (historicalaudiod, for one), so `ps`, which may ask the kernel for any, is the fallback."""
+    if pid not in PROCESS_NAMES:
+        name = ""
+        try:
+            import ctypes
+            buf = ctypes.create_string_buffer(256)
+            if ctypes.CDLL("/usr/lib/libSystem.B.dylib").proc_name(int(pid), buf, 256) > 0:
+                name = buf.value.decode("utf-8", "replace")
+        except Exception:
+            pass
+        if not name:
+            name = os.path.basename(run(["ps", "-p", str(int(pid)), "-o", "comm="], timeout=5).stdout.strip())
+        PROCESS_NAMES[pid] = name
+    return PROCESS_NAMES[pid]
+
+
+def coreaudio_inputs():
+    """[(pid, identity)] for every process that has an audio input open right now; identity is its bundle id, or
+    its executable name when it has none. None if this can't be asked (not macOS, macOS before 14, any error)."""
+    if system() != "mac":
+        return None
+    try:
+        import ctypes
+        import ctypes.util
+
+        class Address(ctypes.Structure):
+            _fields_ = [("selector", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("element", ctypes.c_uint32)]
+
+        ca = ctypes.CDLL(ctypes.util.find_library("CoreAudio") or "/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+        cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation")
+                         or "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        ca.AudioObjectGetPropertyDataSize.argtypes = [ctypes.c_uint32, ctypes.POINTER(Address), ctypes.c_uint32,
+                                                      ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+        ca.AudioObjectGetPropertyData.argtypes = [ctypes.c_uint32, ctypes.POINTER(Address), ctypes.c_uint32,
+                                                  ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
+        cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+        cf.CFStringGetCString.restype = ctypes.c_bool
+        cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+        def address(name):
+            return Address(fourcc(CA_SELECTORS[name]), fourcc(CA_GLOBAL), CA_MAIN)
+
+        def get(obj, name, ctype):
+            value, size = ctype(), ctypes.c_uint32(ctypes.sizeof(ctype))
+            if ca.AudioObjectGetPropertyData(obj, ctypes.byref(address(name)), 0, None, ctypes.byref(size),
+                                             ctypes.byref(value)):
+                return None
+            return value.value
+
+        size = ctypes.c_uint32(0)
+        if ca.AudioObjectGetPropertyDataSize(CA_SYSTEM_OBJECT, ctypes.byref(address("list")), 0, None,
+                                             ctypes.byref(size)):
+            return None   # macOS before 14 has no process list
+        ids = (ctypes.c_uint32 * (size.value // 4))()
+        size = ctypes.c_uint32(ctypes.sizeof(ids))
+        if ca.AudioObjectGetPropertyData(CA_SYSTEM_OBJECT, ctypes.byref(address("list")), 0, None,
+                                         ctypes.byref(size), ctypes.byref(ids)):
+            return None
+        found = []
+        for obj in ids[:size.value // 4]:
+            if get(obj, "input", ctypes.c_uint32) != 1:   # also skips a process that quit while we were looking
+                continue
+            pid = get(obj, "pid", ctypes.c_int32)
+            ref = get(obj, "bundle", ctypes.c_void_p)
+            bundle = ""
+            if ref:
+                buf = ctypes.create_string_buffer(512)
+                if cf.CFStringGetCString(ref, buf, 512, CF_UTF8):
+                    bundle = buf.value.decode("utf-8", "replace")
+                cf.CFRelease(ref)   # the property is a copy: it is ours to release
+            found.append((pid or 0, bundle or process_name(pid) or "unknown"))
+        return found
+    except Exception:
+        return None
+
+
+def matches(identity, patterns):
+    """True if identity is one of the patterns or lives under one ("com.hnc.Discord" matches
+    "com.hnc.Discord.helper.Renderer"). Case does not matter."""
+    ident = identity.lower()
+    return any(ident == p.lower() or ident.startswith(p.lower() + ".") for p in patterns if p)
+
+
+def mic_list(config, key, default):
+    value = config.get(key)
+    return [str(v) for v in value] if isinstance(value, list) else list(default)
+
+
+def mic_enabled(config):
+    return system() == "mac" and config.get("mic_aware") is not False
+
+
+def mic_report(config=None):
+    """(state, rows) for the microphone now. rows = [(pid, identity, role)], role "ignored", "call" or "busy";
+    state is "call" if any row is a call, else "busy" if any is busy, else "free". None if it can't be asked."""
+    config = load_config() if config is None else config
+    inputs = coreaudio_inputs()
+    if inputs is None:
+        return None
+    ignore, calls = mic_list(config, "mic_ignore", MIC_IGNORE), mic_list(config, "mic_calls", MIC_CALLS)
+    rows = [(pid, ident, "ignored" if matches(ident, ignore) else "call" if matches(ident, calls) else "busy")
+            for pid, ident in inputs]
+    roles = {r[2] for r in rows}
+    return ("call" if "call" in roles else "busy" if "busy" in roles else "free"), rows
+
+
+def mic_state(config=None):
+    """"free", "busy" or "call". Never raises, and never says anything but "free" when it can't tell."""
+    try:
+        config = load_config() if config is None else config
+        if not mic_enabled(config):
+            return "free"
+        report = mic_report(config)
+        return report[0] if report else "free"
+    except Exception:
+        return "free"
+
+
+def notify(title, body):
+    """A macOS notification (the text travels as arguments, never inside the script). True if it was posted."""
+    if system() != "mac":
+        return False
+    script = ["on run argv", "display notification (item 2 of argv) with title (item 1 of argv)", "end run"]
+    r = run(["osascript"] + [x for line in script for x in ("-e", line)] + [title, body])
+    return r.returncode == 0
 
 
 # --- queue ---------------------------------------------------------------------------------------------------
@@ -348,12 +553,28 @@ def start_speaker():
         subprocess.Popen(argv, creationflags=flags, **quiet)
 
 
-def enqueue(text, lang, spawn=True):
+def enqueue(text, lang, spawn=True, who=""):
+    """`who` is how the agent is called (or the repository): the title of the notification shown in a call."""
+    item = {"text": text, "lang": lang}
+    if who:
+        item["who"] = who
     with lock("queue.lock"):
         with open(QUEUE, "a", encoding="utf-8") as f:
-            f.write(json.dumps({"text": text, "lang": lang}, ensure_ascii=False) + "\n")
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
     if spawn:
         start_speaker()
+
+
+def requeue_front(item):
+    """Puts an announcement back as the next one, whole: it was cut while being spoken and is said again."""
+    with lock("queue.lock"):
+        lines = QUEUE.read_text(encoding="utf-8").splitlines() if QUEUE.exists() else []
+        QUEUE.write_text(json.dumps(item, ensure_ascii=False) + "\n" + "".join(line + "\n" for line in lines),
+                         encoding="utf-8")
+
+
+def waiting():
+    return QUEUE.exists() and QUEUE.stat().st_size > 0
 
 
 def dequeue():
@@ -372,24 +593,70 @@ def dequeue():
             pass
 
 
-def speak_queue(say=None):
-    """One speaker at a time. If something arrived between emptying the queue and releasing the lock, go again."""
+def default_say(config):
+    """The function that really speaks. Returns False if the microphone opened and cut it, else True."""
+    def say(text, voice, lang, stop=None):
+        try:
+            speak(text, voice, lang, config.get("command") or "", stop)
+        except Interrupted:
+            return False
+        return True
+    return say
+
+
+def notify_instead(item, lang, notifier):
+    """In a call nothing is spoken: the announcement becomes a notification, and the log keeps it."""
+    who = item.get("who") or "Claude"
+    ok = notifier(PHRASES[lang]["call_title"].format(p=who), item["text"])
+    write_log(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} call: {'notified' if ok else 'notification failed'} "
+              f"{who}: {item['text']}")
+
+
+def speak_queue(say=None, mic=None, notifier=None, sleep=time.sleep):
+    """One speaker at a time. If something arrived between emptying the queue and releasing the lock, go again.
+
+    Before each announcement it looks at the microphone (`mic()` returns "free", "busy" or "call"):
+      free  speak it, and keep watching: if the microphone opens in the middle, the speech stops and the whole
+            announcement goes back to the front of the queue;
+      busy  an app is listening to you: wait for it to close (it stays in the queue), then speak;
+      call  you are in a call: show a notification with the text and do not speak it."""
     config, voices = load_config(), {}
-    say = say or (lambda text, voice, lang: speak(text, voice, lang, config.get("command") or ""))
+    if mic is None and mic_enabled(config):
+        mic = mic_state
+    notifier = notifier or notify
+    say = say or default_say(config)
     while True:
         held = lock("speaker.lock", wait=False)
         if not held:
             return   # another speaker is running and will read this announcement too
         with held:
+            waited = False   # true after a wait: the microphone must stay closed MIC_SETTLE before we speak
             while True:
+                state = mic() if mic else "free"
+                if state == "busy":
+                    if not waiting():
+                        break   # nothing to say: don't hang around
+                    waited = True
+                    sleep(MIC_POLL)
+                    continue
+                if state == "free" and waited:
+                    waited = False
+                    sleep(MIC_SETTLE)
+                    continue   # look again: it may have opened during the pause
                 item = dequeue()
                 if not item:
                     break
                 lang = item.get("lang") if item.get("lang") in LANGUAGES else language(config)
+                if state == "call":
+                    notify_instead(item, lang, notifier)
+                    continue
                 if lang not in voices:
                     voices[lang] = chosen_voice(lang, config)
-                say(item["text"], voices[lang], lang)
-        if not (QUEUE.exists() and QUEUE.stat().st_size):
+                stop = (lambda: mic() != "free") if mic else None
+                if say(item["text"], voices[lang], lang, stop=stop) is False:
+                    requeue_front(item)   # cut: it is said again, whole, when the microphone is free
+                    waited = True
+        if not waiting():
             return
 
 
@@ -550,7 +817,7 @@ def hook(stdin_text):
         write_log(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} {event} [{kind}] {agent_label(agent) or project}: "
                   f"{text or '(quiet)'}")
         if text:
-            enqueue(text, lang)
+            enqueue(text, lang, who=agent_label(agent) or project)
     except Exception:
         pass
     return ""
@@ -581,11 +848,72 @@ def status():
            engine_line(config)]
     if not can_speak(config):
         out.append(NO_ENGINE.get(system(), "Nothing can speak here. Set a program with /voice-notify command <program>."))
+    out.append(mic_line(config))
     if QUEUE.exists() and QUEUE.stat().st_size:
         out.append(f"queued: {len(QUEUE.read_text(encoding='utf-8').splitlines())}")
     if LOG.exists():
         out.append("last events:\n  " + "\n  ".join(LOG.read_text(encoding="utf-8").splitlines()[-5:]))
     return "\n".join(out)
+
+
+def mic_line(config):
+    if system() != "mac":
+        return "microphone: not watched on this system (speaks as usual)"
+    if config.get("mic_aware") is False:
+        return "microphone: not watched (/voice-notify mic on)"
+    report = mic_report(config)
+    if report is None:
+        return "microphone: can't be read here, it needs macOS 14 or newer (speaks as usual)"
+    return f"microphone: watched, {report[0]} now (/voice-notify mic)"
+
+
+def mic_valid(identifier):
+    return bool(re.fullmatch(r"[\w.\-]{1,200}", identifier))
+
+
+MIC_USAGE = ("usage: /voice-notify mic [on | off | now | ignore [add <id> | remove <id> | reset] | "
+             "call [add <id> | remove <id> | reset]]")
+
+
+def mic_command(rest):
+    """/voice-notify mic ...: look at the microphone, switch the watching on or off, edit the two lists."""
+    config = load_config()
+    action = rest[0].lower() if rest else "status"
+    if action in ("on", "off") and len(rest) == 1:
+        save_config(mic_aware=action == "on")
+        return mic_command([])
+    if action == "now" and len(rest) == 1:
+        report = mic_report(config)
+        if report is None:
+            return "The microphone can't be read here (it needs macOS 14 or newer)."
+        meaning = {"ignored": "ignored", "call": "in a call: notifies, never speaks", "busy": "listening: it waits"}
+        rows = [f"  {ident}  (pid {pid})  {meaning[role]}" for pid, ident, role in report[1]]
+        return "\n".join([f"apps with the microphone input open now: {len(report[1])}"] + rows + [
+            f"state: {report[0]}", "An app that should not count: /voice-notify mic ignore add <id>."])
+    if action in ("ignore", "call"):
+        key, default = ("mic_ignore", MIC_IGNORE) if action == "ignore" else ("mic_calls", MIC_CALLS)
+        current, sub, arg = mic_list(config, key, default), (rest[1].lower() if len(rest) > 1 else "list"), rest[2:]
+        if sub == "list" and not arg:
+            pass
+        elif sub == "add" and len(arg) == 1 and mic_valid(arg[0]):
+            if not any(c.lower() == arg[0].lower() for c in current):
+                save_config(**{key: current + [arg[0]]})
+        elif sub == "remove" and len(arg) == 1 and mic_valid(arg[0]):
+            save_config(**{key: [c for c in current if c.lower() != arg[0].lower()]})
+        elif sub == "reset" and not arg:
+            save_config(**{key: None})
+        else:
+            return MIC_USAGE
+        return mic_command([])
+    if action == "status" and len(rest) <= 1:
+        calls, ignored = mic_list(config, "mic_calls", MIC_CALLS), mic_list(config, "mic_ignore", MIC_IGNORE)
+        return "\n".join([
+            mic_line(config),
+            "  an app listening to you: it waits and speaks when the input closes; cut in the middle, it starts over",
+            f"  call apps (notification, no speech): {', '.join(calls) or '(none)'}",
+            f"  ignored (always listening): {', '.join(ignored) or '(none)'}",
+            "  edit: /voice-notify mic call|ignore add|remove|reset <id>; who is listening now: /voice-notify mic now"])
+    return MIC_USAGE
 
 
 def list_voices():
@@ -613,7 +941,7 @@ def join_args(args):
 
 
 USAGE = ("usage: /voice-notify [on [voice] | off | test | voices | status | lang <en|pt-BR|auto> | "
-         "voice <name|auto> | command <program...|off>]")
+         "voice <name|auto> | command <program...|off> | mic [on|off|now|ignore ...|call ...]]")
 
 
 def command(args):
@@ -649,6 +977,8 @@ def command(args):
     if action == "command" and rest:
         save_config(command="" if rest == ["off"] else join_args(rest))
         return status()
+    if action == "mic":
+        return mic_command(rest)
     if action == "status":
         return status()
     return USAGE

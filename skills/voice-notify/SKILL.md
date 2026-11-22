@@ -1,7 +1,7 @@
 ---
 name: voice-notify
-description: Turn spoken notifications on or off, play a test, list voices, pick a voice or program, or show the status.
-argument-hint: "[on [voice] | off | test | voices | status | lang <en|pt-BR|auto> | voice <name|auto> | command <program|off>]"
+description: Turn spoken notifications on or off, play a test, list voices, pick a voice or program, watch the microphone (wait while you talk, notify in calls), or show the status.
+argument-hint: "[on [voice] | off | test | voices | status | lang <en|pt-BR|auto> | voice <name|auto> | command <program|off> | mic [on|off|now|call ...|ignore ...]]"
 allowed-tools: Bash(sh "${CLAUDE_PLUGIN_ROOT}/scripts/run.sh"*)
 disable-model-invocation: true
 ---

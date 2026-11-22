@@ -1,7 +1,7 @@
 {
   "name": "voice-notify",
   "displayName": "Voice Notify",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Spoken notifications when a Claude Code session finishes or needs you: Claude tells you itself, in first person, what it did and what it needs. macOS, Linux and Windows.",
   "author": {
     "name": "c-Morette",

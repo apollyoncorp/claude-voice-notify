@@ -10,6 +10,7 @@ When a session finishes, your computer reads a short note that Claude itself wro
 - It speaks with your system's own voice. Nothing goes over the network, unless you plug in a program that does.
 - You can pick any installed voice, or [your own speech program](#use-your-own-speech-program).
 - English and Brazilian Portuguese.
+- **It doesn't talk over you (macOS 14+).** While an app is listening to your microphone, for example when you dictate to Claude, it waits. In a call, it shows a notification instead of speaking. See [Microphone and calls](#microphone-and-calls).
 
 | System | Status |
 |---|---|
@@ -26,6 +27,7 @@ When a session finishes, your computer reads a short note that Claude itself wro
 - [Quick start](#quick-start)
 - [Requirements](#requirements)
 - [What you will hear](#what-you-will-hear)
+- [Microphone and calls](#microphone-and-calls)
 - [Commands](#commands)
 - [Choosing a voice](#choosing-a-voice): [macOS](#macos), [Windows](#windows), [Linux](#linux)
 - [Use your own speech program](#use-your-own-speech-program)
@@ -103,9 +105,34 @@ To hear a sample at any time, run `/voice-notify test`.
 | `/voice-notify voice <name>\|auto` | Choose a voice from `voices`. `auto` picks the best one. |
 | `/voice-notify command <program>\|off` | Speak with [your own program](#use-your-own-speech-program) instead of the system voice. |
 | `/voice-notify lang en\|pt-BR\|auto` | Choose the language. `auto` follows the system language. |
-| `/voice-notify status` | On or off, language, voice, what speaks, and the last five events. |
+| `/voice-notify mic` | macOS: the microphone watch, the state now, and the two app lists. |
+| `/voice-notify mic on\|off` | Turn the microphone watch on or off. It is on by default. |
+| `/voice-notify mic now` | Which apps have the microphone input open right now, and what each one counts as. |
+| `/voice-notify mic call [add <id>\|remove <id>\|reset]` | Show or edit the apps that count as a call. |
+| `/voice-notify mic ignore [add <id>\|remove <id>\|reset]` | Show or edit the apps that are never counted. |
+| `/voice-notify status` | On or off, language, voice, what speaks, the microphone, and the last five events. |
 
 Without arguments, `/voice-notify` shows the status. The full name of the command is `/voice-notify:voice-notify`. It is not `/voice` because Claude Code already has a built-in `/voice` (voice dictation), and the built-in wins.
+
+## Microphone and calls
+
+Speaking over you is rude, and in a call it can leak into the other person's ears. On **macOS 14 or newer** the plugin looks at which apps have the microphone input open, and decides before every announcement:
+
+| Microphone | What happens |
+|---|---|
+| **Free** | It speaks, as always. |
+| **An app is listening to you** (you dictate to Claude, you record something) | It does not speak. The announcement waits in the queue and is spoken when the input has stayed closed for a second. If the input opens **in the middle** of a sentence, the speech stops and that announcement goes back to the front of the queue, whole, to be said again later. |
+| **You are in a call** (Discord, Zoom, Teams, FaceTime, Slack by default) | It never speaks. It shows a macOS notification, with the agent's name as the title (*"Orion wants to talk to you"*, *"O Orion quer falar com você"*) and the summary as the text. It does not speak it afterwards: you read it, or you don't. It also goes to the log. |
+
+- **Who counts as what.** An app is identified by its bundle id, and an id also covers the helper processes under it: `com.hnc.Discord` covers `com.hnc.Discord.helper.Renderer`. If a call app and a dictation app listen at the same time, the call wins.
+- **Always-listening processes are ignored.** The system keeps the input open all day for `com.apple.CoreSpeech` (Siri) and `historicalaudiod`, so those two never count. This is also why the plugin doesn't use the device-level "is running somewhere" flag: it is always on.
+- **Lists you can change.** `/voice-notify mic now` shows who is listening and how each one counts. If an app that should not count shows up, `/voice-notify mic ignore add <id>`. If a call app is missing, `/voice-notify mic call add <id>`. The first edit copies the default list into `config.json`, so you can also remove a default; `reset` goes back to the defaults.
+- **Defaults for calls:** `com.hnc.Discord`, `us.zoom.xos`, `com.microsoft.teams2` (new Teams), `com.microsoft.teams` (classic Teams), `com.apple.FaceTime`, `com.tinyspeck.slackmacgap` (Slack, for huddles). Only Discord was seen in a real call; the others are the apps' published bundle ids and match their helper processes the same way.
+- **Calls in a browser** (Google Meet, for example) show up as the browser's own process, which also listens when you dictate in a web page. Add it to the call list only if you prefer a notification to speech in both cases: `/voice-notify mic call add com.google.Chrome`.
+- **Turn it off** with `/voice-notify mic off`. Then it speaks whatever the microphone is doing.
+- **When it can't tell, it speaks as before.** Linux, Windows, macOS before 14, or any error when asking CoreAudio mean the microphone counts as free. A failed query never holds the queue.
+
+The notification is posted with `osascript`, so macOS shows it under *Script Editor*. If you see none, check System Settings > Notifications > Script Editor.
 
 ## Choosing a voice
 
@@ -260,6 +287,8 @@ Claude writes the 🔊 summary in the language set here, even if you chat with i
 - **"no Python 3.9 or newer found".** Install Python 3.9+ and make sure `python3`, `python` or `py` runs in a terminal.
 - **It never reads a summary.** Claude only writes the 🔊 line when there is something to tell you. If it never does, check that the plugin was on before you sent the message: the instruction goes with each prompt.
 - **It says the wrong project.** The name comes from the folder where the session started, not from where Claude moved later with `cd`. Inside a git repository, it is the repository's folder name.
+- **It stays silent while I'm not talking.** Run `/voice-notify mic now`. An app you don't use for talking may keep the input open: `/voice-notify mic ignore add <its id>`. Or switch the watch off with `/voice-notify mic off`.
+- **In a call I get neither voice nor notification.** The notification needs Script Editor to be allowed in System Settings > Notifications. The announcement is still in `voice.log` (`/voice-notify status`).
 - **I hear two voices.** Another hook, yours or another plugin's, also speaks. Keep one of them.
 - **The voice sounds robotic.** See [Choosing a voice](#choosing-a-voice) for your system.
 - **`claude -p` and SDK scripts don't speak.** That is on purpose: nobody is listening to them.
@@ -280,6 +309,8 @@ The saved name is only read from the first 140 characters of the 🔊 line, and 
 
 Hooks never speak by themselves. They append to a queue and start a detached speaker. Only one speaker runs at a time: it reads the queue in order and speaks one announcement after another. The hook returns in milliseconds.
 
+On macOS 14+ the speaker also asks CoreAudio for the processes that have an input open (about 10 ms, from Python's `ctypes`, no compiled helper). It looks before each announcement, every half second while one waits, and every 0.4 s while one is being spoken. See [Microphone and calls](#microphone-and-calls).
+
 Two cases are skipped on purpose. `stop_hook_active` means Claude is continuing because of a Stop hook, so the session hasn't really finished. `CLAUDE_CODE_ENTRYPOINT=sdk*` means `claude -p` and SDK scripts, which nobody is listening to.
 
 ## Configuration files
@@ -289,10 +320,10 @@ State lives in `~/.claude/voice-notify/` (on Windows, `%USERPROFILE%\.claude\voi
 | File | Purpose |
 |---|---|
 | `enabled` | Exists = on. Every hook checks it, so on and off apply to open sessions right away. |
-| `config.json` | `{"language": "auto" \| "en" \| "pt-BR", "voice": "" (auto) \| name, "command": "" \| your program}` |
-| `queue.jsonl` | Announcements waiting to be spoken. |
+| `config.json` | `{"language": "auto" \| "en" \| "pt-BR", "voice": "" (auto) \| name, "command": "" \| your program, "mic_aware": true \| false, "mic_calls": [bundle ids], "mic_ignore": [bundle ids]}`. The last three are optional; without the lists the defaults apply. |
+| `queue.jsonl` | Announcements waiting to be spoken, with the name of who is talking (it becomes the title of the call notification). |
 | `agents.json` | The last name each session's agent gave, by `session_id`, with the article for Portuguese. The newest 200 sessions are kept. |
-| `voice.log` | The last 50 hook events, including the quiet ones. It shows what the plugin heard and what it said. |
+| `voice.log` | The last 50 hook events, including the quiet ones, and the announcements that became a notification in a call. It shows what the plugin heard and what it said. |
 | `queue.lock`, `speaker.lock`, `agents.lock` | Lock files (`flock` on macOS and Linux, `msvcrt` on Windows). |
 
 The state is deliberately outside the plugin folder, so it survives updates and reinstalls. The hooks and the command also find it without any environment variable. Set `CLAUDE_VOICE_NOTIFY_HOME` to move it; the tests use this.
@@ -316,12 +347,14 @@ These all came up while building this, and each one shaped the code.
 7. **A notification must never break a session.** Every error in the hook is swallowed: bad input, a missing `git`, a full disk. A hook error shows up in the session, and a spoken notification is not worth that. If nothing speaks, look at `/voice-notify status` and `~/.claude/voice-notify/voice.log`.
 8. **`python3` isn't a given.** On Windows it may be missing, or it may be the Microsoft Store placeholder that only prints a message. So the hooks call `sh scripts/run.sh`, which tries `python3`, `python` and `py` and keeps the first one that really is Python 3.9+. Claude Code runs hooks with `sh` on macOS and Linux and with Git Bash on Windows.
 9. **Windows consoles don't speak UTF-8 by default.** The hook reads its input as raw bytes and decodes them as UTF-8, or the 🔊 would never be found. It also writes its JSON as plain ASCII, with the 🔊 escaped, so no code page can garble it. On Windows, the text for System.Speech goes in an environment variable, never inside a PowerShell command line.
+10. **The microphone can't be read from the device.** `kAudioDevicePropertyDeviceIsRunningSomewhere` on the default input is 1 all day, because Siri's `corespeechd` and `historicalaudiod` keep the input open. The usable signal is per process: since macOS 14, CoreAudio lists the audio processes (`kAudioHardwarePropertyProcessObjectList`), and each has `kAudioProcessPropertyIsRunningInput`, `...PID` and `...BundleID`. A call app's audio often runs in a helper process (`com.hnc.Discord.helper.Renderer`), and dictation in the Claude desktop app runs in `com.anthropic.claudefordesktop.helper`, so the lists match the bundle id and everything under it. A process with no bundle id is named from `proc_name`, or from `ps` when macOS refuses that.
+11. **A speech that can be cut needs a process that can be killed.** The speaker used to wait for the voice process with a blocking call. Now it waits in 0.4 s steps and checks the microphone between them; if the input opens, it ends the voice process (the whole process group), and puts the announcement back at the front of the queue.
 
 ## Privacy
 
 Everything stays on your computer. There are no network calls, no telemetry, no API key and no second model.
 
-- **Reads:** the hook input on stdin, the git metadata of the session folder, and, optionally, the desktop app's session record (see pitfall 3).
+- **Reads:** the hook input on stdin, the git metadata of the session folder, optionally the desktop app's session record (see pitfall 3), and, on macOS, which apps have the microphone input open (their bundle ids and process names only, never audio).
 - **Speaks:** with your system's speech engine, or with the program you set. If that program calls a cloud service, the announcements go to it.
 - **Writes:** only to `~/.claude/voice-notify/`. The log keeps the last 50 announcements, summaries included. `agents.json` holds the agent names that appeared in the 🔊 lines, with session ids.
 
@@ -334,6 +367,9 @@ Everything stays on your computer. There are no network calls, no telemetry, no 
 - The saved name is whatever Claude said after *"this is"*. If it introduces itself in another way, no name is saved and the repository name is used.
 - The 🔊 line also shows in the chat.
 - A new prompt doesn't interrupt an announcement that is already playing.
+- The microphone watch is macOS 14+ only. It looks every 0.4 s while speaking, so the first words of a dictation can overlap the end of a sentence for a moment.
+- In a call, the notification is all you get: there is no way yet to listen to it afterwards from the notification.
+- The default call apps other than Discord were not tried in a real call.
 - Speaking rate and volume follow the system, unless you use your own program.
 - It relies on `last_assistant_message` in the Stop hook input, which recent Claude Code versions send.
 - `CLAUDE_CODE_ENTRYPOINT` isn't documented. If it changes, `claude -p` runs might start speaking.
@@ -361,6 +397,14 @@ The `narrator` plugin in [midudev/better-claude](https://github.com/midudev/bett
 
 **Sistemas:** macOS (uso diário, com as vozes da Siri), Linux (novo na 0.2, testado num container Debian com eSpeak NG) e Windows (novo na 0.2, ainda não testado em máquina de verdade).
 
+**Não fala por cima de você (macOS 14+):** o plugin vê quais apps estão com o microfone aberto e decide antes de cada aviso:
+
+- **Microfone livre:** fala, como sempre.
+- **Um app ouvindo você** (você dita para o Claude, grava algo): não fala. O aviso espera na fila e sai quando o microfone fica fechado por um segundo. Se o microfone abrir **no meio** de uma frase, a fala para e o aviso volta para a frente da fila, inteiro, para ser dito depois.
+- **Em call** (Discord, Zoom, Teams, FaceTime e Slack, por padrão): não fala nada. Mostra uma notificação do macOS com o nome do agente no título (*"O Orion quer falar com você"*) e o resumo no texto, e registra no log. Não fala depois: você lê, ou não.
+
+`/voice-notify mic` mostra o estado e as duas listas, `mic now` mostra quem está com o microfone aberto agora, `mic call add|remove|reset <id>` edita os apps de call e `mic ignore add|remove|reset <id>` os apps que nunca contam (o `com.apple.CoreSpeech` e o `historicalaudiod` já vêm ignorados, porque a Siri mantém o microfone aberto o dia todo). `mic off` desliga a vigia. Em Linux, Windows, macOS anterior ao 14, ou se a consulta falhar, o plugin fala como antes. Detalhes na seção [Microphone and calls](#microphone-and-calls).
+
 **Instalação**, no terminal:
 
 ```bash
@@ -381,7 +425,8 @@ Depois, abra uma sessão **nova** e rode `/voice-notify on`. Você ouve *"Voz li
 - `/voice-notify voice <nome>`: escolhe uma voz. `voice auto` volta para a automática.
 - `/voice-notify command <programa>`: fala com um programa seu. `command off` volta para a voz do sistema.
 - `/voice-notify lang pt-BR|en|auto`: escolhe o idioma.
-- `/voice-notify status`: mostra se está ligado, o idioma, a voz, quem fala e os últimos avisos.
+- `/voice-notify mic`: a vigia do microfone (só macOS), o estado agora e as listas de apps.
+- `/voice-notify status`: mostra se está ligado, o idioma, a voz, quem fala, o microfone e os últimos avisos.
 
 O nome não é `/voice` porque o Claude Code já tem um `/voice` próprio, de ditado.
 
