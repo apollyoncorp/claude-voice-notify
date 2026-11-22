@@ -78,14 +78,18 @@ class AnnouncementTest(unittest.TestCase):
         self.vn = voice_notify
         self.rng = random.Random(1)
 
-    def say(self, event, payload, lang="en"):
-        return self.vn.announcement(event, payload, "my app", lang, self.rng)
+    def say(self, event, payload, lang="en", agent=None):
+        return self.vn.announcement(event, payload, "my app", lang, self.rng, agent=agent)
 
-    def test_stop_with_summary(self):
+    def test_stop_with_summary_speaks_only_the_agents_line(self):
         out = self.say("Stop", {"last_assistant_message": "Done.\n🔊 Tests pass. Approve the push."})
-        opening = out[: -len(" Tests pass. Approve the push.")]
-        self.assertIn(opening, [p.format(p="my app") for p in self.vn.PHRASES["en"]["done_summary"]])
-        self.assertTrue(out.endswith("Tests pass. Approve the push."))
+        self.assertEqual(out, "Tests pass. Approve the push.")
+        out = self.say("Stop", {"last_assistant_message": "Ok.\n🔊 Terminei a landing."}, "pt-BR")
+        self.assertEqual(out, "Terminei a landing.")
+
+    def test_stop_with_summary_ignores_a_remembered_name(self):
+        out = self.say("Stop", {"last_assistant_message": "🔊 Alex, this is Orion. All done."}, agent=("", "Orion"))
+        self.assertEqual(out, "Alex, this is Orion. All done.")
 
     def test_stop_without_summary(self):
         out = self.say("Stop", {"last_assistant_message": "Done."})
@@ -109,11 +113,87 @@ class AnnouncementTest(unittest.TestCase):
         out = self.say("Notification", {"notification_type": "elicitation_dialog"}, "pt-BR")
         self.assertEqual(out, "my app tem uma pergunta pra você.")
 
+    def test_remembered_name_replaces_the_repository_in_portuguese(self):
+        ask = {"notification_type": "permission_prompt"}
+        self.assertIn(self.say("Notification", ask, "pt-BR", agent=("o", "Orion")),
+                      ["O Orion precisa de você.", "O Orion está esperando sua aprovação."])
+        out = self.say("Notification", {"notification_type": "elicitation_dialog"}, "pt-BR", agent=("a", "Luna"))
+        self.assertEqual(out, "A Luna tem uma pergunta pra você.")
+        out = self.say("Stop", {"last_assistant_message": "Done."}, "pt-BR", agent=("a", "Luna"))
+        self.assertIn(out, ["A Luna terminou.", "Pronto, A Luna acabou.", "A Luna terminou, dá uma olhada quando puder."])
+        self.assertNotIn("my app", out)
+
+    def test_remembered_name_replaces_the_repository_in_english(self):
+        ask = {"notification_type": "permission_prompt"}
+        self.assertIn(self.say("Notification", ask, agent=("", "Orion")),
+                      ["Orion needs you.", "Orion is waiting for your approval."])
+        out = self.say("Notification", {"notification_type": "elicitation_dialog"}, agent=("", "Luna"))
+        self.assertEqual(out, "Luna has a question for you.")
+        out = self.say("Stop", {"last_assistant_message": "Done."}, agent=("", "Luna"))
+        self.assertIn(out, ["Luna is done.", "Luna finished.", "Luna is done, take a look when you can."])
+
+    def test_a_name_from_the_other_language_has_no_article(self):
+        out = self.say("Notification", {"notification_type": "elicitation_dialog"}, "pt-BR", agent=("", "Luna"))
+        self.assertEqual(out, "Luna tem uma pergunta pra você.")
+
+    def test_without_a_name_the_repository_is_still_said(self):
+        out = self.say("Notification", {"notification_type": "elicitation_dialog"}, "pt-BR")
+        self.assertEqual(out, "my app tem uma pergunta pra você.")
+        self.assertEqual(self.say("Notification", {"notification_type": "elicitation_dialog"}),
+                         "my app has a question for you.")
+
     def test_both_languages_have_every_phrase(self):
         self.assertEqual(set(self.vn.PHRASES["en"]), set(self.vn.PHRASES["pt-BR"]))
         self.assertEqual(set(self.vn.INSTRUCTION), set(self.vn.LANGUAGES))
         for text in self.vn.INSTRUCTION.values():
             self.assertIn("🔊", text)
+
+    def test_instruction_asks_for_first_person_and_not_to_hide_the_project(self):
+        en, pt = self.vn.INSTRUCTION["en"], self.vn.INSTRUCTION["pt-BR"]
+        self.assertIn("first person", en)
+        self.assertIn("this is <Name>", en)
+        self.assertIn("which project", en)
+        self.assertNotIn("don't repeat the project name", en)
+        self.assertIn("primeira pessoa", pt)
+        self.assertIn("aqui é o <Nome>", pt)
+        self.assertIn("em que projeto", pt)
+        self.assertNotIn("sem repetir o nome do projeto", pt)
+
+
+class AgentNameTest(unittest.TestCase):
+    def setUp(self):
+        import voice_notify
+        self.vn = voice_notify
+
+    def test_portuguese_with_article(self):
+        f = self.vn.agent_from_summary
+        self.assertEqual(f("Alex, aqui é o Orion. Terminei a landing."), ("o", "Orion"))
+        self.assertEqual(f("Aqui é a Luna, tenho uma dúvida."), ("a", "Luna"))
+        self.assertEqual(f("Alex, aqui é a Kryden Web. Pronto."), ("a", "Kryden Web"))
+
+    def test_english(self):
+        f = self.vn.agent_from_summary
+        self.assertEqual(f("Alex, this is Orion. I finished the landing page."), ("", "Orion"))
+        self.assertEqual(f("This is Luna, I have a question."), ("", "Luna"))
+
+    def test_no_name_when_the_agent_did_not_introduce_itself(self):
+        f = self.vn.agent_from_summary
+        self.assertIsNone(f("Alex, terminei o trabalho no acme web. Falta você aprovar."))
+        self.assertIsNone(f("Alex, I finished the work on acme web."))
+        self.assertIsNone(f("Terminei no kryden web, aqui é o resultado dos testes."))
+        self.assertIsNone(f("Hi, this is done and tested."))
+        self.assertIsNone(f(""))
+        self.assertIsNone(f(None))
+
+    def test_only_the_opening_counts(self):
+        late = "Terminei a landing e subi tudo para o servidor de testes sem erro nenhum. " * 3 + "Aqui é o Orion."
+        self.assertIsNone(self.vn.agent_from_summary(late))
+
+    def test_label_keeps_the_article(self):
+        self.assertEqual(self.vn.agent_label(("o", "Orion")), "O Orion")
+        self.assertEqual(self.vn.agent_label(("a", "Luna")), "A Luna")
+        self.assertEqual(self.vn.agent_label(("", "Orion")), "Orion")
+        self.assertEqual(self.vn.agent_label(None), "")
 
 
 @unittest.skipUnless(hasattr(os, "fork"), "flock queue needs macOS or Linux")
@@ -214,10 +294,90 @@ class HookTest(StateTestCase):
                                           "last_assistant_message": "ok\n🔊 All green."})
         self.assertEqual(out, "")
         text, lang = enqueue.call_args[0]
-        self.assertIn("my cool app", text)
-        self.assertTrue(text.endswith("All green."))
+        self.assertEqual(text, "All green.")
         self.assertEqual(lang, "en")
         self.assertIn("Stop", self.vn.LOG.read_text())
+
+    def folder(self, name="my-cool_app"):
+        folder = Path(self.home) / name
+        folder.mkdir(exist_ok=True)
+        return folder
+
+    def stop_then_ask(self, summary, lang, session="s1", other="s1"):
+        """A Stop with the agent's line, then a permission prompt (in session `other`). Returns what was queued."""
+        self.turn_on()
+        self.vn.save_config(language=lang)
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(self.folder())}):
+            _, first = self.run_hook({"hook_event_name": "Stop", "session_id": session,
+                                      "last_assistant_message": summary})
+            _, second = self.run_hook({"hook_event_name": "Notification", "session_id": other,
+                                       "notification_type": "permission_prompt"})
+        return first.call_args[0][0], second.call_args[0][0]
+
+    def test_name_from_the_summary_is_reused_for_the_permission_prompt_pt(self):
+        spoken, ask = self.stop_then_ask("ok\n🔊 Alex, aqui é o Orion. Terminei a landing.", "pt-BR")
+        self.assertEqual(spoken, "Alex, aqui é o Orion. Terminei a landing.")
+        self.assertIn(ask, ["O Orion precisa de você.", "O Orion está esperando sua aprovação."])
+        self.assertNotIn("my cool app", ask)
+
+    def test_name_from_the_summary_is_reused_for_the_permission_prompt_en(self):
+        spoken, ask = self.stop_then_ask("ok\n🔊 Alex, this is Luna. I finished the landing page.", "en")
+        self.assertEqual(spoken, "Alex, this is Luna. I finished the landing page.")
+        self.assertIn(ask, ["Luna needs you.", "Luna is waiting for your approval."])
+
+    def test_feminine_article_is_kept(self):
+        _, ask = self.stop_then_ask("🔊 Aqui é a Luna. Tenho uma dúvida.", "pt-BR")
+        self.assertIn(ask, ["A Luna precisa de você.", "A Luna está esperando sua aprovação."])
+
+    def test_no_name_stored_falls_back_to_the_repository(self):
+        spoken, ask = self.stop_then_ask("🔊 Alex, terminei o trabalho no acme web.", "pt-BR")
+        self.assertEqual(spoken, "Alex, terminei o trabalho no acme web.")
+        self.assertIn(ask, ["my cool app precisa de você.", "my cool app está esperando sua aprovação."])
+        self.assertFalse(self.vn.AGENTS.exists())
+
+    def test_names_are_kept_per_session(self):
+        _, ask = self.stop_then_ask("🔊 Aqui é o Orion. Pronto.", "pt-BR", session="s1", other="s2")
+        self.assertIn(ask, ["my cool app precisa de você.", "my cool app está esperando sua aprovação."])
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(self.folder())}):
+            _, again = self.run_hook({"hook_event_name": "Notification", "session_id": "s1",
+                                      "notification_type": "elicitation_dialog"})
+        self.assertEqual(again.call_args[0][0], "O Orion tem uma pergunta pra você.")
+
+    def test_stop_without_the_line_uses_the_remembered_name(self):
+        self.turn_on()
+        self.vn.save_config(language="pt-BR")
+        self.vn.remember_agent("s1", ("a", "Luna"))
+        with mock.patch.dict(os.environ, {"CLAUDE_PROJECT_DIR": str(self.folder())}):
+            _, enqueue = self.run_hook({"hook_event_name": "Stop", "session_id": "s1",
+                                        "last_assistant_message": "Done."})
+        self.assertIn(enqueue.call_args[0][0], ["A Luna terminou.", "Pronto, A Luna acabou.",
+                                                "A Luna terminou, dá uma olhada quando puder."])
+
+    def test_a_new_name_replaces_the_old_one(self):
+        self.vn.remember_agent("s1", ("o", "Orion"))
+        self.vn.remember_agent("s1", ("a", "Luna"))
+        self.assertEqual(self.vn.recall_agent("s1"), ("a", "Luna"))
+
+    def test_nothing_is_stored_without_a_session_id(self):
+        self.vn.remember_agent(None, ("o", "Orion"))
+        self.assertFalse(self.vn.AGENTS.exists())
+        self.assertIsNone(self.vn.recall_agent(None))
+        self.assertIsNone(self.vn.recall_agent("never-seen"))
+
+    def test_old_names_are_pruned(self):
+        for i in range(self.vn.AGENTS_KEEP + 5):
+            self.vn.remember_agent(f"s{i}", ("", f"Name{i}"))
+        data = json.loads(self.vn.AGENTS.read_text())
+        self.assertEqual(len(data), self.vn.AGENTS_KEEP)
+        self.assertIn(f"s{self.vn.AGENTS_KEEP + 4}", data)
+        self.assertNotIn("s0", data)
+
+    def test_broken_state_file_is_ignored(self):
+        self.vn.AGENTS.parent.mkdir(parents=True, exist_ok=True)
+        self.vn.AGENTS.write_text("{not json")
+        self.assertIsNone(self.vn.recall_agent("s1"))
+        self.vn.remember_agent("s1", ("o", "Orion"))
+        self.assertEqual(self.vn.recall_agent("s1"), ("o", "Orion"))
 
     def test_bad_input_never_raises(self):
         self.turn_on()
@@ -402,6 +562,13 @@ class CommandTest(StateTestCase):
             self.assertEqual(self.vn.load_config()["voice"], "Microsoft Maria Desktop")
         with mock.patch.object(self.vn, "system", return_value="windows"):
             self.assertEqual(self.vn.join_args(["C:/tools/my tts.exe", "-v", "x"]), '"C:/tools/my tts.exe" -v x')
+
+    def test_test_speaks_a_first_person_sample_without_the_repository(self):
+        with mock.patch.object(self.vn, "system_engine", return_value="avspeech"), \
+                mock.patch.object(self.vn, "enqueue") as enqueue, \
+                mock.patch.object(self.vn, "system_language", return_value="en"):
+            self.vn.command(["test"])
+        self.assertEqual(enqueue.call_args[0], (self.vn.PHRASES["en"]["test"], "en"))
 
     def test_on_off_lang_voice(self):
         with mock.patch.object(self.vn, "system_engine", return_value="avspeech"), \

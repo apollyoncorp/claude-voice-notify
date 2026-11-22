@@ -2,9 +2,9 @@
 
 Spoken notifications for [Claude Code](https://code.claude.com) on **macOS**, **Linux** and **Windows**.
 
-When a session finishes, your computer says the repository name and reads a short summary that Claude itself wrote at the end of its reply. When a session is waiting for your approval or has a question, it tells you that too. You can work in another window, or away from the screen, and still know which session needs you.
+When a session finishes, your computer reads a short note that Claude itself wrote at the end of its reply, in first person, as if it were talking to you. An agent with a name of its own introduces itself. When a session is waiting for your approval or has a question, it tells you that too. You can work in another window, or away from the screen, and still know which session needs you.
 
-> *"acme web is done. The tests pass and the migration is ready. Approve the push when you can."*
+> *"Alex, this is Orion. I finished the landing page and I'm waiting for your approval. There are two options for you to choose from."*
 
 - One Python script, standard library only. No dependencies, no API key, no second model.
 - It speaks with your system's own voice. Nothing goes over the network, unless you plug in a program that does.
@@ -81,14 +81,16 @@ To hear a sample at any time, run `/voice-notify test`.
 
 | When | English | Português |
 |---|---|---|
-| A session finished, with a summary | *"acme web is done. The tests pass. Approve the push when you can."* | *"Pronto, acme web acabou. Os testes passam. Falta você aprovar o envio."* |
-| A session finished, nothing to add | *"acme web is done."* | *"acme web terminou."* |
-| Claude needs permission for a tool | *"acme web is waiting for your approval."* | *"acme web está esperando sua aprovação."* |
-| Claude asked you a question | *"acme web has a question for you."* | *"acme web tem uma pergunta pra você."* |
+| An agent with a name finished | *"Alex, this is Orion. I finished the landing page and I'm waiting for your approval."* | *"Alex, aqui é o Orion. Terminei a landing e estou esperando sua aprovação."* |
+| A session without a named agent finished | *"Alex, I finished the work on acme web. The tests pass."* | *"Alex, terminei o trabalho no acme web. Os testes passam."* |
+| Claude needs permission for a tool, and the agent gave a name earlier | *"Orion is waiting for your approval."* | *"O Orion está esperando sua aprovação."* |
+| Claude asked you a question, and the agent gave a name earlier | *"Luna has a question for you."* | *"A Luna tem uma pergunta pra você."* |
+| The same two events, no name given yet | *"acme web needs you."* | *"acme web precisa de você."* |
+| A session finished without a 🔊 line | *"Orion is done."* (or *"acme web is done."* with no name) | *"O Orion terminou."* (ou *"acme web terminou."* sem nome) |
 
-- **The opening sentence varies a little**, so it doesn't sound like a machine reading the same line.
-- **The name is the repository**, never the session title. A worktree is announced by its main repository.
-- **The summary is the last line of Claude's reply that starts with 🔊.** You will also see that line in the chat. Claude adds it only when there is something you need to know, so short replies often end without one.
+- **The agent speaks for itself.** The plugin reads Claude's 🔊 line as written and adds nothing in front of it. The line is the last one of the reply that starts with 🔊. You will also see it in the chat. Claude adds it only when there is something you need to know, so short replies often end without one.
+- **Who is talking comes from Claude, not from the plugin.** If Claude has a name of its own (from a `CLAUDE.md` or an agent file), it opens with *"this is &lt;name&gt;"* (in Portuguese, *"aqui é o/a &lt;nome&gt;"*). If it has none, it says the project it is in. It uses your name if it knows it. The plugin never has a name built in.
+- **Events Claude doesn't write get the same name.** A permission prompt or a question has no 🔊 line, so the plugin reuses the last name Claude gave **in that session**. In Portuguese it keeps the article: *"O Orion"*, *"A Luna"*. A session that never gave a name hears the repository name, as before. Worktrees are announced by their main repository.
 
 ## Commands
 
@@ -266,13 +268,15 @@ Claude writes the 🔊 summary in the language set here, even if you chat with i
 
 Three hooks call [`scripts/run.sh`](scripts/run.sh), which finds a Python 3.9+ and runs [`scripts/voice_notify.py`](scripts/voice_notify.py):
 
-1. **`UserPromptSubmit`** (synchronous, 10 s timeout). When the voice is on and something can speak, it adds one instruction to the turn: end the final reply with one line that starts with 🔊, with 2 to 4 short sentences written to be heard (what was done, what is needed from you), and no code, paths, markdown or links. That costs about 100 tokens per prompt while on, and nothing while off.
-2. **`Stop`** (async). It takes `last_assistant_message` from the hook input and finds the last line that **starts** with 🔊. A 🔊 in the middle of a sentence doesn't count. It strips markdown and links, caps the text at 420 characters, and queues *"&lt;repo&gt; is done. &lt;summary&gt;"*. Without a 🔊 line it just says *"&lt;repo&gt; is done."*
-3. **`Notification`** (async). A permission prompt becomes *"&lt;repo&gt; needs you."* A question (`elicitation_dialog`) becomes *"&lt;repo&gt; has a question for you."* Idle reminders and unknown types stay quiet, but still go to the log.
+1. **`UserPromptSubmit`** (synchronous, 10 s timeout). When the voice is on and something can speak, it adds one instruction to the turn: end the final reply with one line that starts with 🔊, with 2 to 4 short sentences written to be heard, in first person, as if talking to you (what was done, what is needed from you). Claude opens by introducing itself: *"this is &lt;name&gt;"* if it has a name of its own, otherwise the project it is in. No code, paths, markdown or links. That costs about 150 tokens per prompt while on, and nothing while off.
+2. **`Stop`** (async). It takes `last_assistant_message` from the hook input and finds the last line that **starts** with 🔊. A 🔊 in the middle of a sentence doesn't count. It strips markdown and links, caps the text at 420 characters, and queues that text as it is. If the opening has *"this is &lt;name&gt;"* or *"aqui é o/a &lt;nome&gt;"*, the plugin also saves the name for this `session_id`. Without a 🔊 line it says *"&lt;name&gt; is done."*, or *"&lt;repo&gt; is done."* when no name was saved.
+3. **`Notification`** (async). A permission prompt becomes *"&lt;name&gt; needs you."* A question (`elicitation_dialog`) becomes *"&lt;name&gt; has a question for you."* The name is the one saved for the session, or the repository name when there is none. Idle reminders and unknown types stay quiet, but still go to the log.
 
-The summary comes from the Claude that did the work, in the same reply. It knows what matters and costs no extra call. Other tools send the transcript to a second model to summarize it.
+The note comes from the Claude that did the work, in the same reply. It knows what matters and costs no extra call. Other tools send the transcript to a second model to summarize it.
 
-The name you hear is the repository, never the session title. It comes from `git rev-parse --git-common-dir`, so a worktree speaks as its main repository. Dashes, dots and underscores become spaces, so `acme-web` is read as "acme web". Outside a repository, the folder name is used.
+The fallback name is the repository, never the session title. It comes from `git rev-parse --git-common-dir`, so a worktree speaks as its main repository. Dashes, dots and underscores become spaces, so `acme-web` is read as "acme web". Outside a repository, the folder name is used.
+
+The saved name is only read from the first 140 characters of the 🔊 line, and only in the form *"this is Name."* (the name is up to three capitalized words, followed by a period, comma or the end of the line). Anything else is ignored, so a stray *"this is done"* never becomes a name.
 
 Hooks never speak by themselves. They append to a queue and start a detached speaker. Only one speaker runs at a time: it reads the queue in order and speaks one announcement after another. The hook returns in milliseconds.
 
@@ -287,8 +291,9 @@ State lives in `~/.claude/voice-notify/` (on Windows, `%USERPROFILE%\.claude\voi
 | `enabled` | Exists = on. Every hook checks it, so on and off apply to open sessions right away. |
 | `config.json` | `{"language": "auto" \| "en" \| "pt-BR", "voice": "" (auto) \| name, "command": "" \| your program}` |
 | `queue.jsonl` | Announcements waiting to be spoken. |
+| `agents.json` | The last name each session's agent gave, by `session_id`, with the article for Portuguese. The newest 200 sessions are kept. |
 | `voice.log` | The last 50 hook events, including the quiet ones. It shows what the plugin heard and what it said. |
-| `queue.lock`, `speaker.lock` | Lock files (`flock` on macOS and Linux, `msvcrt` on Windows). |
+| `queue.lock`, `speaker.lock`, `agents.lock` | Lock files (`flock` on macOS and Linux, `msvcrt` on Windows). |
 
 The state is deliberately outside the plugin folder, so it survives updates and reinstalls. The hooks and the command also find it without any environment variable. Set `CLAUDE_VOICE_NOTIFY_HOME` to move it; the tests use this.
 
@@ -318,14 +323,15 @@ Everything stays on your computer. There are no network calls, no telemetry, no 
 
 - **Reads:** the hook input on stdin, the git metadata of the session folder, and, optionally, the desktop app's session record (see pitfall 3).
 - **Speaks:** with your system's speech engine, or with the program you set. If that program calls a cloud service, the announcements go to it.
-- **Writes:** only to `~/.claude/voice-notify/`. The log keeps the last 50 announcements, summaries included.
+- **Writes:** only to `~/.claude/voice-notify/`. The log keeps the last 50 announcements, summaries included. `agents.json` holds the agent names that appeared in the 🔊 lines, with session ids.
 
 ## Limitations
 
 - Linux and Windows are new in 0.2 and not yet tried on real machines. Reports are welcome.
 - English and Brazilian Portuguese only.
 - Notification only. There is no voice input.
-- The summary depends on Claude following the instruction. Without the 🔊 line you just hear *"&lt;repo&gt; is done."*
+- The note depends on Claude following the instruction. Without the 🔊 line you just hear *"&lt;name&gt; is done."* (or *"&lt;repo&gt; is done."* when the session never gave a name).
+- The saved name is whatever Claude said after *"this is"*. If it introduces itself in another way, no name is saved and the repository name is used.
 - The 🔊 line also shows in the chat.
 - A new prompt doesn't interrupt an announcement that is already playing.
 - Speaking rate and volume follow the system, unless you use your own program.
@@ -351,7 +357,7 @@ The `narrator` plugin in [midudev/better-claude](https://github.com/midudev/bett
 
 ## Português
 
-**claude-voice-notify** é um plugin para o Claude Code que **fala** quando uma sessão termina ou precisa de você. Ele diz o nome do repositório e lê um resumo de 2 a 4 frases. Quem escreve esse resumo é o próprio Claude, no fim da resposta. Usa a voz do próprio sistema: sem rede, sem chave de API e sem outro modelo. É um projeto não oficial, sem vínculo com a Anthropic.
+**claude-voice-notify** é um plugin para o Claude Code que **fala** quando uma sessão termina ou precisa de você. Quem fala é o próprio Claude: ele escreve, no fim da resposta, uma nota de 2 a 4 frases em primeira pessoa, como se conversasse com você, e a voz lê essa nota do jeito que ela foi escrita. Um agente com nome próprio se apresenta ("Alex, aqui é o Orion. Terminei a landing e estou esperando sua aprovação."). Sem nome, ele diz em que projeto está. Usa a voz do próprio sistema: sem rede, sem chave de API e sem outro modelo. É um projeto não oficial, sem vínculo com a Anthropic.
 
 **Sistemas:** macOS (uso diário, com as vozes da Siri), Linux (novo na 0.2, testado num container Debian com eSpeak NG) e Windows (novo na 0.2, ainda não testado em máquina de verdade).
 
@@ -396,9 +402,11 @@ Não precisa colocá-la como voz do sistema. Com `voice auto`, o plugin escolhe 
 
 **Como funciona:**
 
-- `UserPromptSubmit`: pede ao Claude que termine a resposta com uma linha 🔊.
-- `Stop`: põe na fila "*repo* terminou" e o resumo.
-- `Notification`: avisa quando há aprovação ou pergunta esperando você.
+- `UserPromptSubmit`: pede ao Claude que termine a resposta com uma linha 🔊, em primeira pessoa, começando por se apresentar: "aqui é o/a *Nome*" se tem nome próprio, ou o projeto se não tem. Chama você pelo nome se souber.
+- `Stop`: põe na fila essa linha, sem nada na frente. Se ela tem "aqui é o/a *Nome*", o plugin guarda o nome dessa sessão.
+- `Notification`: avisa quando há aprovação ou pergunta esperando você, com o nome guardado da sessão: "O Orion está esperando sua aprovação." Sem nome guardado, usa o nome do repositório.
+
+O plugin não traz nome nenhum de fábrica: o nome do agente e o seu vêm do que o Claude sabe.
 
 Um falador solto lê a fila em ordem, um aviso por vez. Problemas, configuração, armadilhas e limitações estão nas seções em inglês acima. O estado fica em `~/.claude/voice-notify/`.
 

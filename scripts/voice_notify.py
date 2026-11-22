@@ -3,9 +3,10 @@
 
 One file, standard library only, Python 3.9+. Claude Code runs it as a hook:
 
-  UserPromptSubmit  (sync)   asks Claude to end its reply with one "🔊 ..." summary line
-  Stop              (async)  queues "<repo> is done." plus that summary
-  Notification      (async)  queues "<repo> needs you." when a permission prompt or question waits
+  UserPromptSubmit  (sync)   asks Claude to end its reply with one "🔊 ..." line, in first person
+  Stop              (async)  queues that line as it is: the agent speaks for itself
+  Notification      (async)  queues "<name> needs you." when a permission prompt or question waits, with the
+                             name the agent used in this session, or the repository name if it never gave one
 
 and the /voice-notify command runs it with on, off, test, voices, status, lang, voice or command.
 
@@ -22,6 +23,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 STATE = Path(os.environ.get("CLAUDE_VOICE_NOTIFY_HOME") or Path.home() / ".claude" / "voice-notify")
@@ -29,41 +31,53 @@ ENABLED = STATE / "enabled"      # exists = speak
 CONFIG = STATE / "config.json"   # {"language": "auto" | "en" | "pt-BR", "voice": "" (auto) | name, "command": ""}
 QUEUE = STATE / "queue.jsonl"    # announcements waiting their turn, one JSON per line
 LOG = STATE / "voice.log"        # last 50 hook events, including the silent ones
+AGENTS = STATE / "agents.json"   # {session_id: {"article", "name", "at"}}: the name an agent used in that session
+AGENTS_KEEP = 200
 LOG_LINES = 50
 
 LANGUAGES = ("en", "pt-BR")
 
-# The summary is written by the same Claude that did the work, so it costs nothing extra and knows what matters.
+# The line is written by the same Claude that did the work, so it costs nothing extra and knows what matters.
+# It speaks as itself, in first person. The "this is <name>" / "aqui é o <nome>" opening is what the plugin
+# reads to remember the agent's name for this session (see agent_from_summary).
 INSTRUCTION = {
     "en": "Voice notifications are on (claude-voice-notify): at the end of your final reply this turn, if there is "
           "something the user needs to know, close with ONE line starting with 🔊 and 2 to 4 short sentences in "
-          "English, written to be heard: what was done and what you need from the user (approve, review, decide). "
-          "No code, file paths, markdown or links, and don't repeat the project name (the voice already says it). "
-          "If nothing is worth saying, leave the line out.",
+          "English, written to be heard. Speak as yourself, in the first person, as if talking to the person: what "
+          "you did and what you need from them (approve, review, decide). Open by introducing yourself. If you have "
+          "a name of your own as an agent or persona (from the CLAUDE.md or your agent file), say \"this is <Name>.\" "
+          "(\"Alex, this is Orion. I finished the landing page...\"); if you don't, say which project you are in "
+          "(\"Alex, I finished the work on acme web...\"). Use the person's name if you know it. "
+          "No code, file paths, markdown or links. If nothing is worth saying, leave the line out.",
     "pt-BR": "Voz ligada (claude-voice-notify): no fim da resposta final deste turno, se houver algo que a pessoa "
              "precise saber, feche com UMA linha começando com 🔊 e 2 a 4 frases curtas em português, escritas para "
-             "serem ouvidas: o que foi feito e o que precisa dela (aprovar, olhar, decidir). Sem código, caminho de "
-             "arquivo, markdown nem link, e sem repetir o nome do projeto (a voz já diz). Se não houver nada que "
-             "valha falar, não escreva a linha.",
+             "serem ouvidas. Fale como você mesmo, em primeira pessoa, como se conversasse com a pessoa: o que fez e "
+             "o que precisa dela (aprovar, olhar, decidir). Comece se apresentando. Se você tem nome próprio de "
+             "agente ou persona (do CLAUDE.md ou do seu arquivo de agente), diga \"aqui é o <Nome>.\" ou \"aqui é a "
+             "<Nome>.\" (\"Alex, aqui é o Orion. Terminei a landing...\"); se não tem, diga em que projeto está "
+             "(\"Alex, terminei o trabalho no acme web...\"). Chame a pessoa pelo nome se souber. "
+             "Sem código, caminho de arquivo, markdown nem link. Se não houver nada que valha falar, não escreva a linha.",
 }
 
-# How a person would tell you: the repository name (never the session title), then the 🔊 summary if there is one.
+# How a person would tell you. With a 🔊 line, the agent's own words are spoken and nothing else. The rest is for what
+# the agent did not write: a Stop without a 🔊 line, a permission prompt, a question. {p} is the agent's name
+# ("O Orion", "Orion") when the session gave one, else the repository name (never the session title).
 PHRASES = {
     "en": {
         "done": ("{p} is done.", "{p} finished.", "{p} is done, take a look when you can.", "All done in {p}."),
-        "done_summary": ("{p} is done.", "{p} finished.", "All done in {p}."),
+        "done_named": ("{p} is done.", "{p} finished.", "{p} is done, take a look when you can."),
         "approval": ("{p} needs you.", "{p} is waiting for your approval."),
         "question": ("{p} has a question for you.",),
         "on": "Voice on.",
-        "test": "This is how the summary will sound.",
+        "test": "This is how I will sound when I have something to tell you.",
     },
     "pt-BR": {
         "done": ("{p} terminou.", "Pronto, {p} acabou.", "{p} terminou, dá uma olhada quando puder.", "Terminei no {p}."),
-        "done_summary": ("{p} terminou.", "Pronto, {p} acabou.", "Terminei no {p}."),
+        "done_named": ("{p} terminou.", "Pronto, {p} acabou.", "{p} terminou, dá uma olhada quando puder."),
         "approval": ("{p} precisa de você.", "{p} está esperando sua aprovação."),
         "question": ("{p} tem uma pergunta pra você.",),
         "on": "Voz ligada.",
-        "test": "É assim que o resumo vai soar.",
+        "test": "É assim que eu vou soar quando tiver algo pra te contar.",
     },
 }
 
@@ -427,20 +441,78 @@ def session_folder(payload):
     return os.environ.get("CLAUDE_PROJECT_DIR") or desktop_session_folder() or payload.get("cwd") or os.getcwd()
 
 
-def announcement(event, payload, project, lang, rng=random):
-    """The sentence to speak for a hook event, or None to stay quiet."""
+NAME = r"[A-ZÀ-ÖØ-Ý][\w'’-]*(?:\s+[A-ZÀ-ÖØ-Ý][\w'’-]*){0,2}"   # up to three capitalized words
+AGENT_INTRO = (   # "aqui é o Orion." / "aqui é a Luna," / "this is Orion." in the opening of the line
+    re.compile(r"(?i:\baqui\s+é\s+(?P<art>o|a)\s+)(?P<name>" + NAME + r")(?=\s*[.,:;!]|\s*$)"),
+    re.compile(r"(?i:\bthis\s+is\s+)(?P<name>" + NAME + r")(?=\s*[.,:;!]|\s*$)"),
+)
+
+
+def agent_from_summary(summary):
+    """The (article, name) an agent gave in the opening of its 🔊 line ("aqui é o Orion", "this is Luna"),
+    or None. The article ("o", "a" or "") is kept for Portuguese, to say "O Orion precisa de você"."""
+    head = (summary or "")[:140]
+    for pattern in AGENT_INTRO:
+        m = pattern.search(head)
+        if m:
+            return (m.groupdict().get("art") or "").lower(), " ".join(m.group("name").split())
+    return None
+
+
+def agent_label(agent):
+    """How to say the agent as the subject of a sentence: "O Orion", "A Luna", "Orion". "" without one."""
+    if not agent:
+        return ""
+    article, name = agent
+    label = f"{article} {name}".strip()
+    return label[:1].upper() + label[1:]
+
+
+def read_agents():
+    try:
+        data = json.loads(AGENTS.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def remember_agent(session_id, agent):
+    """Keeps the name an agent used in this session, for the events it doesn't write (permission, question)."""
+    if not session_id or not agent:
+        return
+    with lock("agents.lock"):
+        data = read_agents()
+        data[str(session_id)] = {"article": agent[0], "name": agent[1], "at": time.time()}
+        newest = sorted(data.items(), key=lambda kv: kv[1].get("at", 0) if isinstance(kv[1], dict) else 0)
+        AGENTS.write_text(json.dumps(dict(newest[-AGENTS_KEEP:]), ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def recall_agent(session_id):
+    """The (article, name) remembered for this session, or None."""
+    entry = read_agents().get(str(session_id)) if session_id else None
+    if isinstance(entry, dict) and entry.get("name"):
+        return str(entry.get("article") or ""), str(entry["name"])
+    return None
+
+
+def announcement(event, payload, project, lang, rng=random, agent=None):
+    """The sentence to speak for a hook event, or None to stay quiet. `agent` is the (article, name) the agent
+    gave earlier in this session: it replaces the repository name when the agent didn't write the sentence."""
     p = PHRASES[lang]
+    who = agent_label(agent)
     if event == "Stop":
         summary = spoken_summary(payload.get("last_assistant_message"))
         if summary:
-            return f"{rng.choice(p['done_summary']).format(p=project)} {summary}"
+            return summary   # the agent speaks for itself: no "<repo> is done." in front
+        if who:
+            return rng.choice(p["done_named"]).format(p=who)
         return rng.choice(p["done"]).format(p=project)
     if event == "Notification":
         kind = payload.get("notification_type") or payload.get("message") or ""
         if "permission" in kind.lower():
-            return rng.choice(p["approval"]).format(p=project)
+            return rng.choice(p["approval"]).format(p=who or project)
         if re.search(r"elicitation|question", kind, re.I):
-            return rng.choice(p["question"]).format(p=project)
+            return rng.choice(p["question"]).format(p=who or project)
     return None   # idle reminders and anything new stay quiet; the log shows them
 
 
@@ -467,9 +539,16 @@ def hook(stdin_text):
             # ASCII-only JSON: the 🔊 travels as an escape, safe on any console encoding
             return json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": INSTRUCTION[lang]}})
         project = spoken_name(session_folder(payload))
-        text = announcement(event, payload, project, lang)
+        session_id = payload.get("session_id")
+        agent = None
+        if event == "Stop":   # the agent introduces itself in its own line: remember who it is in this session
+            agent = agent_from_summary(spoken_summary(payload.get("last_assistant_message")))
+            remember_agent(session_id, agent)
+        agent = agent or recall_agent(session_id)
+        text = announcement(event, payload, project, lang, agent=agent)
         kind = payload.get("notification_type") or ""
-        write_log(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} {event} [{kind}] {project}: {text or '(quiet)'}")
+        write_log(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} {event} [{kind}] {agent_label(agent) or project}: "
+                  f"{text or '(quiet)'}")
         if text:
             enqueue(text, lang)
     except Exception:
@@ -557,8 +636,7 @@ def command(args):
         if not can_speak():
             return status()
         lang = language()
-        enqueue(f"{random.choice(PHRASES[lang]['done_summary']).format(p=spoken_name(session_folder({})))} "
-                f"{PHRASES[lang]['test']}", lang)
+        enqueue(PHRASES[lang]["test"], lang)
         return "Speaking a test announcement" + ("." if ENABLED.exists() else " (notifications are off: /voice-notify on).")
     if action == "voices":
         return list_voices()
